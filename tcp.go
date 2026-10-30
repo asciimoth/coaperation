@@ -21,7 +21,7 @@ type TCPCapabilities struct {
 type TCPConfig struct {
 	// Handler receives peer requests.
 	Handler Handler
-	// MaxMessageSize defaults to 1 MiB and must allow a 32 KiB payload.
+	// MaxMessageSize defaults to 1 MiB and must fit the initial CSM.
 	MaxMessageSize uint32
 	// BlockWiseTransfer includes the capability in the local CSM.
 	BlockWiseTransfer bool
@@ -36,10 +36,11 @@ func (c TCPConfig) defaults() TCPConfig {
 
 // TCPConn is a bidirectional CoAP connection. Both peers can issue requests.
 type TCPConn struct {
-	conn    net.Conn
-	cfg     TCPConfig
-	reader  *bufio.Reader
-	writeMu sync.Mutex
+	conn     net.Conn
+	cfg      TCPConfig
+	reader   *bufio.Reader
+	writeMu  sync.Mutex
+	handlers sync.WaitGroup
 
 	mu        sync.Mutex
 	pending   map[string]chan *Message
@@ -59,16 +60,20 @@ func NewTCPConn(conn net.Conn, config TCPConfig) (*TCPConn, error) {
 		return nil, errors.New("coap: nil TCP connection")
 	}
 	config = config.defaults()
-	if config.MaxMessageSize < 33*1024 {
-		return nil, errors.New("coap: TCP MaxMessageSize must allow a 32 KiB payload")
-	}
-	connectionContext, cancel := context.WithCancel(context.Background())
-	c := &TCPConn{conn: conn, cfg: config, reader: bufio.NewReader(conn), pending: make(map[string]chan *Message), peer: TCPCapabilities{MaxMessageSize: 1152}, peerReady: make(chan struct{}), closed: make(chan struct{}), ctx: connectionContext, cancel: cancel}
-	go c.readLoop()
 	csm := &Message{Code: CSM, Options: []Option{UintOption(OptionMaxMessageSize, config.MaxMessageSize)}}
 	if config.BlockWiseTransfer {
 		csm.Options = append(csm.Options, UintOption(OptionBlockWiseTransfer, 0))
 	}
+	csmWire, err := MarshalTCP(csm)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(csmWire)) > uint64(config.MaxMessageSize) {
+		return nil, errors.New("coap: TCP MaxMessageSize is smaller than the initial CSM")
+	}
+	connectionContext, cancel := context.WithCancel(context.Background())
+	c := &TCPConn{conn: conn, cfg: config, reader: bufio.NewReader(conn), pending: make(map[string]chan *Message), peer: TCPCapabilities{MaxMessageSize: 1152}, peerReady: make(chan struct{}), closed: make(chan struct{}), ctx: connectionContext, cancel: cancel}
+	go c.readLoop()
 	if err := c.write(csm, false); err != nil {
 		c.fail(err)
 		return nil, err
@@ -122,7 +127,7 @@ func (c *TCPConn) Send(m *Message) error {
 	if m == nil {
 		return errors.New("coap: nil message")
 	}
-	return c.write(m, !m.Code.IsSignaling())
+	return c.write(m, true)
 }
 
 func (c *TCPConn) write(m *Message, honorPeer bool) error {
@@ -230,12 +235,9 @@ func (c *TCPConn) Ping(ctx context.Context) error {
 	}
 }
 
-// Release sends a signaling Release and closes the connection.
+// Release asks the peer to close the connection. Call Close to stop locally.
 func (c *TCPConn) Release() error {
-	if err := c.Send(&Message{Code: Release}); err != nil {
-		return err
-	}
-	return c.Close()
+	return c.Send(&Message{Code: Release})
 }
 
 // Abort sends a signaling Abort with a diagnostic payload and closes.
@@ -272,6 +274,9 @@ func (c *TCPConn) readLoop() {
 			case <-c.closed:
 				return
 			default:
+				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+					_ = c.Abort("malformed CoAP message")
+				}
 				c.fail(err)
 				return
 			}
@@ -291,7 +296,11 @@ func (c *TCPConn) readLoop() {
 			continue
 		}
 		if m.Code.IsRequest() {
-			go c.handleRequest(m)
+			c.handlers.Add(1)
+			go func() {
+				defer c.handlers.Done()
+				c.handleRequest(m)
+			}()
 			continue
 		}
 		c.mu.Lock()
@@ -307,9 +316,17 @@ func (c *TCPConn) readLoop() {
 }
 
 func (c *TCPConn) handleSignal(m *Message) bool {
+	for _, option := range m.Options {
+		if option.Number&1 != 0 {
+			_ = c.Abort("unknown critical signaling option")
+			return false
+		}
+	}
 	switch m.Code {
 	case CSM:
-		capabilities := TCPCapabilities{MaxMessageSize: 1152}
+		c.mu.Lock()
+		capabilities := c.peer
+		c.mu.Unlock()
 		for _, option := range m.Options {
 			switch option.Number {
 			case OptionMaxMessageSize:
@@ -320,6 +337,10 @@ func (c *TCPConn) handleSignal(m *Message) bool {
 				}
 				capabilities.MaxMessageSize = v
 			case OptionBlockWiseTransfer:
+				if len(option.Value) != 0 {
+					_ = c.Abort("invalid Block-Wise-Transfer option")
+					return false
+				}
 				capabilities.BlockWiseTransfer = true
 			}
 		}
@@ -328,7 +349,7 @@ func (c *TCPConn) handleSignal(m *Message) bool {
 		c.mu.Unlock()
 		c.peerOnce.Do(func() { close(c.peerReady) })
 	case Ping:
-		_ = c.Send(&Message{Code: Pong, Token: append([]byte(nil), m.Token...), Options: m.Options})
+		_ = c.Send(&Message{Code: Pong, Token: append([]byte(nil), m.Token...)})
 	case Pong:
 		c.mu.Lock()
 		response := c.pending[string(m.Token)]
@@ -340,7 +361,10 @@ func (c *TCPConn) handleSignal(m *Message) bool {
 			}
 		}
 	case Release:
-		_ = c.Close()
+		go func() {
+			c.handlers.Wait()
+			_ = c.Close()
+		}()
 		return false
 	case Abort:
 		c.fail(fmt.Errorf("coap: peer aborted connection: %s", m.Payload))
@@ -350,12 +374,13 @@ func (c *TCPConn) handleSignal(m *Message) bool {
 }
 
 func (c *TCPConn) handleRequest(request *Message) {
-	if c.cfg.Handler == nil {
-		return
-	}
-	response, err := c.cfg.Handler.ServeCOAP(c.ctx, request)
-	if err != nil {
-		response = &Message{Code: InternalServerError}
+	response := &Message{Code: NotImplemented}
+	if c.cfg.Handler != nil {
+		var err error
+		response, err = c.cfg.Handler.ServeCOAP(c.ctx, request)
+		if err != nil {
+			response = &Message{Code: InternalServerError}
+		}
 	}
 	if response == nil {
 		return

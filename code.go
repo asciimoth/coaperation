@@ -10,8 +10,10 @@ type Code uint8
 const (
 	CodeEmpty Code = 0
 
-	GET Code = 1
-	PUT Code = 3
+	GET    Code = 1
+	POST   Code = 2
+	PUT    Code = 3
+	DELETE Code = 4
 
 	Created                 Code = 65  // 2.01
 	Content                 Code = 69  // 2.05

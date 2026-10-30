@@ -39,11 +39,8 @@ func (b Block) Option(number OptionNumber) (Option, error) {
 	if number != OptionBlock1 && number != OptionBlock2 {
 		return Option{}, errors.New("coap: block option number must be Block1 or Block2")
 	}
-	if b.Number > MaxBlockNumber {
-		return Option{}, errors.New("coap: block number exceeds 20 bits")
-	}
-	if b.Size < 16 || b.Size > 1024 || b.Size&(b.Size-1) != 0 {
-		return Option{}, errors.New("coap: block size must be a power of two from 16 through 1024")
+	if err := b.validate(); err != nil {
+		return Option{}, err
 	}
 	szx := uint32(0)
 	for size := 16; size < b.Size; size <<= 1 {
@@ -54,6 +51,16 @@ func (b Block) Option(number OptionNumber) (Option, error) {
 		raw |= 8
 	}
 	return UintOption(number, raw), nil
+}
+
+func (b Block) validate() error {
+	if b.Number > MaxBlockNumber {
+		return errors.New("coap: block number exceeds 20 bits")
+	}
+	if b.Size < 16 || b.Size > 1024 || b.Size&(b.Size-1) != 0 {
+		return errors.New("coap: block size must be a power of two from 16 through 1024")
+	}
+	return nil
 }
 
 // Offset returns the byte offset of b in the complete body.
@@ -71,6 +78,9 @@ type BlockReassembler struct {
 func (r *BlockReassembler) Add(block Block, payload []byte) (bool, error) {
 	if r.done {
 		return true, errors.New("coap: block transfer is already complete")
+	}
+	if err := block.validate(); err != nil {
+		return false, err
 	}
 	if block.Offset() != r.next {
 		return false, fmt.Errorf("coap: block offset %d, expected %d", block.Offset(), r.next)

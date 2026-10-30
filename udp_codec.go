@@ -30,6 +30,9 @@ func MarshalUDP(m *Message) ([]byte, error) {
 		b = append(b, 0xff)
 		b = append(b, m.Payload...)
 	}
+	if err := validateUDPCodeAndType(m); err != nil {
+		return nil, err
+	}
 	return b, nil
 }
 
@@ -58,8 +61,27 @@ func UnmarshalUDP(data []byte) (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	if m.Code == CodeEmpty && (tkl != 0 || len(m.Options) != 0 || len(m.Payload) != 0) {
-		return nil, errors.New("coap: empty message has token, options, or payload")
+	if err := validateUDPCodeAndType(m); err != nil {
+		return nil, err
 	}
 	return m, nil
+}
+
+func validateUDPCodeAndType(m *Message) error {
+	if class := m.Code.Class(); class == 1 || class == 6 || class == 7 {
+		return errors.New("coap: reserved UDP code class")
+	}
+	if m.Code == CodeEmpty && (len(m.Token) != 0 || len(m.Options) != 0 || len(m.Payload) != 0) {
+		return errors.New("coap: empty message has token, options, or payload")
+	}
+	if m.Type == Reset && m.Code != CodeEmpty {
+		return errors.New("coap: reset message is not empty")
+	}
+	if m.Type == NonConfirmable && m.Code == CodeEmpty {
+		return errors.New("coap: non-confirmable message is empty")
+	}
+	if m.Type == Acknowledgement && m.Code.IsRequest() {
+		return errors.New("coap: acknowledgement message contains a request")
+	}
+	return nil
 }

@@ -38,6 +38,18 @@ func TestExtensionGrammar(t *testing.T) {
 	}
 }
 
+func TestQuotedValuePreservesRawBytes(t *testing.T) {
+	input := []byte{'<', 'x', '>', ';', 't', 'i', 't', 'l', 'e', '=', '"', 0xff, '"'}
+	links, err := Parse(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := Marshal(links)
+	if err != nil || string(wire) != string(input) {
+		t.Fatalf("raw quoted value changed: %x, %v", wire, err)
+	}
+}
+
 func TestParseValidation(t *testing.T) {
 	if links, err := Parse([]byte(" \t")); err != nil || len(links) != 0 {
 		t.Fatalf("empty document = %#v, %v", links, err)
@@ -80,6 +92,7 @@ func TestMarshalValidationAndValues(t *testing.T) {
 func FuzzParse(f *testing.F) {
 	f.Add([]byte(`</x>;rt="sensor"`))
 	f.Add([]byte(`<coap://example.test/a,b>;x=a/b`))
+	f.Add([]byte{'<', 'x', '>', ';', 't', 'i', 't', 'l', 'e', '=', '"', 0xff, '"'})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		links, err := Parse(data)
 		if err != nil {
@@ -89,8 +102,9 @@ func FuzzParse(f *testing.F) {
 		if err != nil {
 			t.Fatalf("cannot marshal accepted input: %v", err)
 		}
-		if _, err := Parse(wire); err != nil {
-			t.Fatalf("cannot parse round trip: %v", err)
+		got, err := Parse(wire)
+		if err != nil || !reflect.DeepEqual(got, links) {
+			t.Fatalf("link-format round trip changed parsed links: got %#v, want %#v, error %v", got, links, err)
 		}
 	})
 }

@@ -2,8 +2,8 @@ package coap
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
-	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -77,6 +77,9 @@ func NewBlockWiseHandler(next Handler, config BlockWiseConfig) (*BlockWiseHandle
 }
 
 func (h *BlockWiseHandler) ServeCOAP(ctx context.Context, request *Message) (*Message, error) {
+	if request == nil {
+		return nil, errors.New("coap: nil block-wise request")
+	}
 	key := transferKey(request)
 	h.expire()
 	if blockOption, ok := request.Option(OptionBlock1); ok {
@@ -203,10 +206,11 @@ func requestedBlock2(request *Message) (Block, bool, error) {
 }
 
 func (h *BlockWiseHandler) responseBlock(full *Message, block Block) (*Message, error) {
+	start := block.Offset()
 	if block.Size > h.config.BlockSize {
 		block.Size = h.config.BlockSize
+		block.Number = uint32(start / uint64(block.Size))
 	}
-	start := block.Offset()
 	if start >= uint64(len(full.Payload)) && (start != 0 || len(full.Payload) != 0) {
 		return &Message{Code: BadOption}, nil
 	}
@@ -226,6 +230,11 @@ func (h *BlockWiseHandler) responseBlock(full *Message, block Block) (*Message, 
 }
 
 func transferKey(m *Message) string {
+	var key []byte
+	appendString := func(value string) {
+		key = binary.BigEndian.AppendUint32(key, uint32(len(value)))
+		key = append(key, value...)
+	}
 	local, remote := "", ""
 	if m.LocalAddr != nil {
 		local = m.LocalAddr.String()
@@ -233,7 +242,19 @@ func transferKey(m *Message) string {
 	if m.RemoteAddr != nil {
 		remote = m.RemoteAddr.String()
 	}
-	return fmt.Sprintf("%s|%s|%x", local, remote, m.Token)
+	appendString(local)
+	appendString(remote)
+	key = append(key, byte(m.Code))
+	for _, option := range m.Options {
+		switch option.Number {
+		case OptionBlock1, OptionBlock2, OptionSize1, OptionSize2:
+			continue
+		}
+		key = binary.BigEndian.AppendUint32(key, uint32(option.Number))
+		key = binary.BigEndian.AppendUint32(key, uint32(len(option.Value)))
+		key = append(key, option.Value...)
+	}
+	return string(key)
 }
 
 func (h *BlockWiseHandler) expire() {

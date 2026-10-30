@@ -49,6 +49,45 @@ func TestTCPCodecAllLengthForms(t *testing.T) {
 	}
 }
 
+func TestTCPRFC8323WireVectors(t *testing.T) {
+	for _, tc := range []struct {
+		message *Message
+		wire    []byte
+	}{
+		{&Message{Code: GET}, []byte{0x00, byte(GET)}},
+		{&Message{Code: 0x43, Token: []byte{0x7f}}, []byte{0x01, 0x43, 0x7f}},
+		{&Message{Code: Ping, Token: []byte{0x42}}, []byte{0x01, byte(Ping), 0x42}},
+		{&Message{Code: GET, Payload: []byte{'x'}}, []byte{0x20, byte(GET), 0xff, 'x'}},
+	} {
+		wire, err := MarshalTCP(tc.message)
+		if err != nil || !bytes.Equal(wire, tc.wire) {
+			t.Fatalf("MarshalTCP(%#v) = %x, %v; want %x", tc.message, wire, err, tc.wire)
+		}
+		got, err := UnmarshalTCP(tc.wire, uint64(len(tc.wire)))
+		if err != nil || got.Code != tc.message.Code || !bytes.Equal(got.Token, tc.message.Token) || !bytes.Equal(got.Payload, tc.message.Payload) {
+			t.Fatalf("UnmarshalTCP(%x) = %#v, %v", tc.wire, got, err)
+		}
+	}
+}
+
+func TestReadTCPConsecutiveFrames(t *testing.T) {
+	reader := bufio.NewReader(bytes.NewReader([]byte{0x00, byte(GET), 0x01, byte(Ping), 0x42}))
+	first, err := ReadTCP(reader, 5)
+	if err != nil || first.Code != GET {
+		t.Fatalf("first frame = %#v, %v", first, err)
+	}
+	second, err := ReadTCP(reader, 5)
+	if err != nil || second.Code != Ping || !bytes.Equal(second.Token, []byte{0x42}) {
+		t.Fatalf("second frame = %#v, %v", second, err)
+	}
+}
+
+func TestTCPShortInputWithLargeDeclaredLength(t *testing.T) {
+	if _, err := UnmarshalTCP([]byte{0xf0, 0xff, 0xff, 0xff, 0xff}, 0); err == nil {
+		t.Fatal("accepted a truncated frame with a large declared length")
+	}
+}
+
 func TestBlockReassemblyWithReducedSize(t *testing.T) {
 	var r BlockReassembler
 	done, err := r.Add(Block{Number: 0, More: true, Size: 32}, bytes.Repeat([]byte{'a'}, 32))
@@ -75,6 +114,44 @@ func TestMalformedMessages(t *testing.T) {
 	} {
 		if _, err := UnmarshalUDP(wire); err == nil {
 			t.Fatalf("accepted malformed wire %x", wire)
+		}
+	}
+}
+
+func TestUDPCodeAndTypeRules(t *testing.T) {
+	invalid := []*Message{
+		{Code: CodeEmpty, Token: []byte{1}},
+		{Code: CodeEmpty, Options: []Option{StringOption(OptionURIPath, "x")}},
+		{Code: CodeEmpty, Payload: []byte{1}},
+		{Type: Reset, Code: Content},
+		{Type: NonConfirmable, Code: CodeEmpty},
+		{Type: Acknowledgement, Code: GET},
+		{Type: Confirmable, Code: 0x20},
+		{Type: Confirmable, Code: 0xc0},
+		{Type: Confirmable, Code: CSM},
+	}
+	for _, message := range invalid {
+		if _, err := MarshalUDP(message); err == nil {
+			t.Fatalf("encoded invalid message: %#v", message)
+		}
+	}
+	for _, wire := range [][]byte{
+		{0x70, byte(Content), 0, 1},
+		{0x50, 0, 0, 1},
+		{0x60, byte(GET), 0, 1},
+		{0x40, byte(CSM), 0, 1},
+	} {
+		if _, err := UnmarshalUDP(wire); err == nil {
+			t.Fatalf("decoded invalid message: %x", wire)
+		}
+	}
+	for _, kind := range []MessageType{Confirmable, Acknowledgement, Reset} {
+		wire, err := MarshalUDP(&Message{Type: kind, Code: CodeEmpty})
+		if err != nil {
+			t.Fatalf("type %d: %v", kind, err)
+		}
+		if _, err := UnmarshalUDP(wire); err != nil {
+			t.Fatalf("type %d round trip: %v", kind, err)
 		}
 	}
 }
@@ -109,8 +186,8 @@ func FuzzUnmarshalUDP(f *testing.F) {
 }
 
 func FuzzUnmarshalTCP(f *testing.F) {
-	f.Add([]byte{0x10, 0x01})
-	f.Add([]byte{0x64, 0x45, 1, 2, 3, 4, 0xff})
+	f.Add([]byte{0x00, 0x01})
+	f.Add([]byte{0x24, 0x45, 1, 2, 3, 4, 0xff, 5})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		message, err := UnmarshalTCP(data, 1<<20)
 		if err != nil {
@@ -122,6 +199,253 @@ func FuzzUnmarshalTCP(f *testing.F) {
 		}
 		if _, err := UnmarshalTCP(wire, 1<<20); err != nil {
 			t.Fatalf("cannot read round trip: %v", err)
+		}
+	})
+}
+
+func FuzzUnmarshalTCPWithoutSizeLimit(f *testing.F) {
+	for _, data := range [][]byte{
+		{0x00, byte(GET)},
+		{0xf0, 0xff, 0xff, 0xff, 0xff},
+		{0xe0, 0xff, 0xff},
+		{0xd0, 0xff, byte(Content)},
+	} {
+		f.Add(data)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 4096 {
+			return
+		}
+		message, err := UnmarshalTCP(data, 0)
+		if err != nil {
+			return
+		}
+		wire, err := MarshalTCP(message)
+		if err != nil {
+			t.Fatalf("cannot encode accepted TCP frame: %v", err)
+		}
+		if _, err := UnmarshalTCP(wire, 0); err != nil {
+			t.Fatalf("cannot decode TCP round trip: %v", err)
+		}
+	})
+}
+
+func FuzzTCPFramingLength(f *testing.F) {
+	for _, payload := range [][]byte{
+		{}, bytes.Repeat([]byte{'a'}, 11), bytes.Repeat([]byte{'b'}, 12),
+		bytes.Repeat([]byte{'c'}, 267), bytes.Repeat([]byte{'d'}, 268),
+	} {
+		f.Add([]byte{1, 2}, payload)
+	}
+	f.Fuzz(func(t *testing.T, token, payload []byte) {
+		if len(token) > 8 || len(payload) > 4096 {
+			return
+		}
+		wire, err := MarshalTCP(&Message{Code: Content, Token: token, Payload: payload})
+		if err != nil {
+			t.Fatal(err)
+		}
+		length := uint64(wire[0] >> 4)
+		headerSize := 1
+		switch length {
+		case 13:
+			length = uint64(wire[1]) + 13
+			headerSize = 2
+		case 14:
+			length = uint64(wire[1])<<8 | uint64(wire[2])
+			length += 269
+			headerSize = 3
+		case 15:
+			length = uint64(wire[1])<<24 | uint64(wire[2])<<16 | uint64(wire[3])<<8 | uint64(wire[4])
+			length += 65805
+			headerSize = 5
+		}
+		wantLength := uint64(len(payload))
+		if len(payload) != 0 {
+			wantLength++ // Payload marker.
+		}
+		if length != wantLength || int(wire[0]&0xf) != len(token) || len(wire) != headerSize+1+len(token)+int(length) {
+			t.Fatalf("TCP header describes length %d and token %d; want %d and %d", length, wire[0]&0xf, wantLength, len(token))
+		}
+		if _, err := UnmarshalTCP(wire, uint64(len(wire))); err != nil {
+			t.Fatalf("decoder rejected encoded frame: %v", err)
+		}
+	})
+}
+
+func FuzzOptionFields(f *testing.F) {
+	for _, data := range [][]byte{
+		{}, {0xd0, 0}, {0xe0, 0, 0}, {0xff},
+		{0xdd, 0xff, 0xff, 0xff, 0xff},
+		{0x01, 0xff, 0},
+	} {
+		f.Add(data)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		options, payload, err := unmarshalOptions(data)
+		if err != nil {
+			return
+		}
+		wire, err := marshalOptions(nil, options)
+		if err != nil {
+			t.Fatalf("cannot encode accepted options: %v", err)
+		}
+		if len(payload) > 0 {
+			wire = append(wire, 0xff)
+			wire = append(wire, payload...)
+		}
+		again, againPayload, err := unmarshalOptions(wire)
+		if err != nil || !reflect.DeepEqual(again, options) || !bytes.Equal(againPayload, payload) {
+			t.Fatalf("option round trip differs: %v", err)
+		}
+	})
+}
+
+func FuzzBlockOption(f *testing.F) {
+	for _, value := range [][]byte{{}, {0}, {7}, {0x19}, {0xff, 0xff, 0xf6}, {0, 0, 0, 0}} {
+		f.Add(value)
+	}
+	f.Fuzz(func(t *testing.T, value []byte) {
+		block, err := ParseBlock(value)
+		if err != nil {
+			return
+		}
+		option, err := block.Option(OptionBlock2)
+		if err != nil {
+			t.Fatalf("cannot encode accepted block: %v", err)
+		}
+		got, err := ParseBlock(option.Value)
+		if err != nil || got != block {
+			t.Fatalf("block round trip differs: %#v, %v", got, err)
+		}
+	})
+}
+
+func FuzzBlockReassembler(f *testing.F) {
+	for _, seed := range []struct {
+		number uint32
+		size   int
+		more   bool
+		body   []byte
+	}{
+		{0, 0, false, nil},
+		{0, 15, false, nil},
+		{0, 16, false, []byte("last")},
+		{0, 24, false, nil},
+		{0, 16, true, bytes.Repeat([]byte{'x'}, 16)},
+		{0, 1024, false, nil},
+		{0, 2048, false, nil},
+		{1, 16, false, nil},
+		{MaxBlockNumber + 1, 16, false, nil},
+	} {
+		f.Add(seed.number, seed.size, seed.more, seed.body)
+	}
+	f.Fuzz(func(t *testing.T, number uint32, size int, more bool, body []byte) {
+		if len(body) > 2048 {
+			return
+		}
+		var r BlockReassembler
+		block := Block{Number: number, Size: size, More: more}
+		done, err := r.Add(block, body)
+		validSize := size >= 16 && size <= 1024 && size&(size-1) == 0
+		valid := number == 0 && validSize && len(body) <= size && (!more || len(body) == size)
+		if !valid {
+			if err == nil || done {
+				t.Fatalf("accepted invalid block %#v with %d bytes", block, len(body))
+			}
+			if got, ok := r.Body(); ok || got != nil {
+				t.Fatal("invalid block changed completion state")
+			}
+			return
+		}
+		if err != nil || done != !more {
+			t.Fatalf("valid block %#v: done=%v err=%v", block, done, err)
+		}
+		got, ok := r.Body()
+		if ok != done || (done && !bytes.Equal(got, body)) {
+			t.Fatalf("body differs: available=%v, length=%d", ok, len(got))
+		}
+	})
+}
+
+func FuzzBlock2ResponseOffset(f *testing.F) {
+	for _, data := range [][]byte{
+		{1, 1, 0, 'a'},
+		{1, 1, 0, 'a', 'b', 'c'},
+		{0, 0, 6},
+		{6, 255, 0, 'x'},
+	} {
+		f.Add(data)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) < 3 || len(data) > 4099 {
+			return
+		}
+		requested := Block{Number: uint32(data[1]), Size: 16 << (data[0] % 7)}
+		serverSize := 16 << (data[2] % 7)
+		body := data[3:]
+		h := &BlockWiseHandler{config: BlockWiseConfig{BlockSize: serverSize}}
+		response, err := h.responseBlock(&Message{Code: Content, Payload: body}, requested)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := requested.Offset()
+		if start >= uint64(len(body)) && (start != 0 || len(body) != 0) {
+			if response.Code != BadOption {
+				t.Fatalf("out-of-range offset %d returned %s", start, response.Code)
+			}
+			return
+		}
+		option, ok := response.Option(OptionBlock2)
+		if !ok {
+			t.Fatal("response has no Block2 option")
+		}
+		block, err := ParseBlock(option.Value)
+		if err != nil || block.Offset() != start || block.Size > requested.Size || block.Size > serverSize {
+			t.Fatalf("block = %#v for requested offset %d: %v", block, start, err)
+		}
+		end := start + uint64(block.Size)
+		if end > uint64(len(body)) {
+			end = uint64(len(body))
+		}
+		if !bytes.Equal(response.Payload, body[start:end]) || block.More != (end < uint64(len(body))) {
+			t.Fatalf("wrong Block2 bytes or More flag at offset %d", start)
+		}
+	})
+}
+
+func FuzzUDPTypeCodeTable(f *testing.F) {
+	for _, data := range [][]byte{
+		{0, 0}, {1, 0}, {2, 1}, {3, byte(Content)},
+		{0, byte(CSM)}, {2, byte(Content), 1}, {0, byte(GET), 1, 2, 3},
+	} {
+		f.Add(data)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) < 2 || len(data) > 11 {
+			return
+		}
+		kind := MessageType(data[0] % 5)
+		code := Code(data[1])
+		m := &Message{Type: kind, Code: code, Token: append([]byte(nil), data[2:]...)}
+		class := code.Class()
+		valid := kind <= Reset && len(m.Token) <= 8 && class != 1 && class != 6 && class != 7 &&
+			(code != CodeEmpty || kind != NonConfirmable && len(m.Token) == 0) &&
+			(kind != Reset || code == CodeEmpty) &&
+			(kind != Acknowledgement || !code.IsRequest())
+		wire, err := MarshalUDP(m)
+		if !valid {
+			if err == nil {
+				t.Fatalf("encoded invalid type %d, code %s, token length %d", kind, code, len(m.Token))
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("rejected valid type %d, code %s: %v", kind, code, err)
+		}
+		got, err := UnmarshalUDP(wire)
+		if err != nil || got.Type != kind || got.Code != code || !bytes.Equal(got.Token, m.Token) {
+			t.Fatalf("UDP round trip = %#v, %v", got, err)
 		}
 	})
 }

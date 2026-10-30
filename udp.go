@@ -90,6 +90,7 @@ type udpPending struct {
 	failures  chan error
 	multi     bool
 	remote    string
+	messageID uint16
 	queueMu   sync.Mutex
 	queue     []*Message
 	notify    chan struct{}
@@ -129,17 +130,19 @@ type UDPEndpoint struct {
 	next    atomic.Uint32
 	writeMu sync.Mutex
 
-	mu         sync.Mutex
-	pending    map[string]*udpPending
-	messageACK map[string]*udpPending
-	duplicates map[string]duplicateEntry
-	peerSlots  map[string]chan struct{}
-	closed     chan struct{}
-	closeOnce  sync.Once
-	errMu      sync.Mutex
-	err        error
-	ctx        context.Context
-	cancel     context.CancelFunc
+	mu                 sync.Mutex
+	pending            map[string]*udpPending
+	messageACK         map[string]*udpPending
+	duplicates         map[string]duplicateEntry
+	responseDuplicates map[string]duplicateEntry
+	nextDuplicatePrune time.Time
+	peerSlots          map[string]chan struct{}
+	closed             chan struct{}
+	closeOnce          sync.Once
+	errMu              sync.Mutex
+	err                error
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
 // NewUDPEndpoint starts CoAP on an existing datagram connection. Closing the
@@ -160,7 +163,7 @@ func NewUDPEndpoint(conn PacketConn, config UDPConfig) (*UDPEndpoint, error) {
 		return nil, fmt.Errorf("coap: initialize message IDs: %w", err)
 	}
 	endpointContext, cancel := context.WithCancel(context.Background())
-	e := &UDPEndpoint{conn: conn, cfg: config, pending: make(map[string]*udpPending), messageACK: make(map[string]*udpPending), duplicates: make(map[string]duplicateEntry), peerSlots: make(map[string]chan struct{}), closed: make(chan struct{}), ctx: endpointContext, cancel: cancel}
+	e := &UDPEndpoint{conn: conn, cfg: config, pending: make(map[string]*udpPending), messageACK: make(map[string]*udpPending), duplicates: make(map[string]duplicateEntry), responseDuplicates: make(map[string]duplicateEntry), peerSlots: make(map[string]chan struct{}), closed: make(chan struct{}), ctx: endpointContext, cancel: cancel}
 	e.next.Store(binary.BigEndian.Uint32(seed[:]))
 	go e.readLoop()
 	return e, nil
@@ -316,7 +319,7 @@ func (e *UDPEndpoint) SendConfirmable(ctx context.Context, message *Message) err
 		return err
 	}
 	defer e.releasePeer(m.RemoteAddr.String())
-	p := &udpPending{ack: make(chan struct{}, 1), failures: make(chan error, 1), remote: m.RemoteAddr.String()}
+	p := &udpPending{ack: make(chan struct{}, 1), failures: make(chan error, 1), remote: m.RemoteAddr.String(), messageID: m.MessageID}
 	ackKey := udpACKKey(p.remote, m.MessageID)
 	e.mu.Lock()
 	if _, exists := e.messageACK[ackKey]; exists {
@@ -528,6 +531,7 @@ func (e *UDPEndpoint) addPending(token string, mid uint16, p *udpPending) error 
 	if _, exists := e.messageACK[ackKey]; exists {
 		return errors.New("coap: message ID is already in use for this peer")
 	}
+	p.messageID = mid
 	e.pending[token] = p
 	e.messageACK[ackKey] = p
 	return nil
@@ -627,9 +631,22 @@ func (e *UDPEndpoint) readLoop() {
 		m, err := UnmarshalUDP(buf[:n])
 		if err != nil {
 			e.reportError(err)
+			if !multicast && n >= 4 && buf[0]>>6 == 1 && buf[0]>>4&3 == byte(Confirmable) {
+				if resetErr := e.Send(&Message{Type: Reset, MessageID: binary.BigEndian.Uint16(buf[2:4]), RemoteAddr: remote}); resetErr != nil {
+					e.reportError(resetErr)
+				}
+			}
 			continue
 		}
 		m.RemoteAddr, m.LocalAddr, m.Multicast = remote, local, multicast
+		if m.Type == Confirmable && m.Code == CodeEmpty {
+			if !m.Multicast {
+				if err := e.Send(&Message{Type: Reset, Code: CodeEmpty, MessageID: m.MessageID, RemoteAddr: remote}); err != nil {
+					e.reportError(err)
+				}
+			}
+			continue
+		}
 		if m.Code.IsRequest() {
 			go e.handleRequest(m)
 			continue
@@ -645,7 +662,21 @@ func (e *UDPEndpoint) reportError(err error) {
 }
 
 func (e *UDPEndpoint) handleResponse(m *Message) {
+	now := time.Now()
+	key := udpACKKey(m.RemoteAddr.String(), m.MessageID)
 	e.mu.Lock()
+	e.pruneDuplicatesLocked(now)
+	if m.Code.IsResponse() && (m.Type == Confirmable || m.Type == NonConfirmable) {
+		if entry, found := e.responseDuplicates[key]; found && now.Before(entry.expires) {
+			e.mu.Unlock()
+			if m.Type == Confirmable && len(entry.response) != 0 {
+				if err := e.writeDatagram(entry.response, m.RemoteAddr); err != nil {
+					e.reportError(err)
+				}
+			}
+			return
+		}
+	}
 	var p *udpPending
 	if m.Code == CodeEmpty && (m.Type == Acknowledgement || m.Type == Reset) {
 		p = e.messageACK[udpACKKey(m.RemoteAddr.String(), m.MessageID)]
@@ -654,10 +685,38 @@ func (e *UDPEndpoint) handleResponse(m *Message) {
 	}
 	e.mu.Unlock()
 	if p == nil || (!p.multi && p.remote != "" && p.remote != m.RemoteAddr.String()) {
+		if m.Type == Confirmable && m.Code.IsResponse() {
+			if err := e.Send(&Message{Type: Reset, MessageID: m.MessageID, RemoteAddr: m.RemoteAddr}); err != nil {
+				e.reportError(err)
+			}
+		}
+		return
+	}
+	if m.Type == Acknowledgement && m.MessageID != p.messageID {
 		return
 	}
 	if m.Type == Confirmable {
-		_ = e.Send(&Message{Type: Acknowledgement, Code: CodeEmpty, MessageID: m.MessageID, RemoteAddr: m.RemoteAddr})
+		ack, err := MarshalUDP(&Message{Type: Acknowledgement, MessageID: m.MessageID})
+		if err != nil {
+			e.reportError(err)
+			return
+		}
+		e.mu.Lock()
+		if e.responseDuplicates == nil {
+			e.responseDuplicates = make(map[string]duplicateEntry)
+		}
+		e.responseDuplicates[key] = duplicateEntry{expires: now.Add(e.cfg.ExchangeLifetime), response: ack}
+		e.mu.Unlock()
+		if err := e.writeDatagram(ack, m.RemoteAddr); err != nil {
+			e.reportError(err)
+		}
+	} else if m.Type == NonConfirmable && m.Code.IsResponse() {
+		e.mu.Lock()
+		if e.responseDuplicates == nil {
+			e.responseDuplicates = make(map[string]duplicateEntry)
+		}
+		e.responseDuplicates[key] = duplicateEntry{expires: now.Add(e.cfg.ExchangeLifetime)}
+		e.mu.Unlock()
 	}
 	if m.Code == CodeEmpty {
 		if m.Type == Reset {
@@ -683,23 +742,44 @@ func (e *UDPEndpoint) handleResponse(m *Message) {
 	}
 }
 
+func (e *UDPEndpoint) pruneDuplicatesLocked(now time.Time) {
+	if now.Before(e.nextDuplicatePrune) {
+		return
+	}
+	for key, item := range e.duplicates {
+		if !now.Before(item.expires) {
+			delete(e.duplicates, key)
+		}
+	}
+	for key, item := range e.responseDuplicates {
+		if !now.Before(item.expires) {
+			delete(e.responseDuplicates, key)
+		}
+	}
+	interval := e.cfg.ExchangeLifetime / 4
+	if interval <= 0 || interval > time.Minute {
+		interval = time.Minute
+	}
+	e.nextDuplicatePrune = now.Add(interval)
+}
+
 func (e *UDPEndpoint) handleRequest(request *Message) {
 	duplicateKey := request.RemoteAddr.String() + "/" + fmt.Sprint(request.MessageID)
-	if request.Type == Confirmable {
-		e.mu.Lock()
-		entry, duplicate := e.duplicates[duplicateKey]
-		if !duplicate {
-			e.duplicates[duplicateKey] = duplicateEntry{expires: time.Now().Add(e.cfg.ExchangeLifetime)}
-		}
-		e.mu.Unlock()
-		if duplicate && time.Now().Before(entry.expires) {
-			if len(entry.response) > 0 {
-				if writeErr := e.writeDatagram(entry.response, request.RemoteAddr); writeErr != nil {
-					e.reportError(writeErr)
-				}
+	now := time.Now()
+	e.mu.Lock()
+	e.pruneDuplicatesLocked(now)
+	entry, duplicate := e.duplicates[duplicateKey]
+	if !duplicate || !now.Before(entry.expires) {
+		e.duplicates[duplicateKey] = duplicateEntry{expires: now.Add(e.cfg.ExchangeLifetime)}
+	}
+	e.mu.Unlock()
+	if duplicate && now.Before(entry.expires) {
+		if request.Type == Confirmable && len(entry.response) > 0 {
+			if writeErr := e.writeDatagram(entry.response, request.RemoteAddr); writeErr != nil {
+				e.reportError(writeErr)
 			}
-			return
 		}
+		return
 	}
 	var response *Message
 	var err error
@@ -776,11 +856,6 @@ func (e *UDPEndpoint) handleRequest(request *Message) {
 	if request.Type == Confirmable {
 		e.mu.Lock()
 		e.duplicates[duplicateKey] = duplicateEntry{expires: time.Now().Add(e.cfg.ExchangeLifetime), response: b}
-		for key, item := range e.duplicates {
-			if time.Now().After(item.expires) {
-				delete(e.duplicates, key)
-			}
-		}
 		e.mu.Unlock()
 	}
 }

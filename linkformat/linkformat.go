@@ -183,11 +183,12 @@ func Marshal(links []Link) ([]byte, error) {
 				b.WriteByte('=')
 				if a.Quoted {
 					b.WriteByte('"')
-					for _, c := range a.Value {
+					for j := 0; j < len(a.Value); j++ {
+						c := a.Value[j]
 						if c == '\\' || c == '"' {
 							b.WriteByte('\\')
 						}
-						b.WriteRune(c)
+						b.WriteByte(c)
 					}
 					b.WriteByte('"')
 				} else {

@@ -12,6 +12,7 @@ type OptionNumber uint32
 
 const (
 	OptionURIHost       OptionNumber = 3
+	OptionETag          OptionNumber = 4
 	OptionURIPort       OptionNumber = 7
 	OptionURIPath       OptionNumber = 11
 	OptionContentFormat OptionNumber = 12
@@ -25,10 +26,14 @@ const (
 	OptionSize1         OptionNumber = 60
 )
 
-// TCP signaling option numbers use a separate option number space.
+// TCP signaling option numbers are scoped to each signaling code.
 const (
-	OptionMaxMessageSize    OptionNumber = 2
-	OptionBlockWiseTransfer OptionNumber = 4
+	OptionMaxMessageSize     OptionNumber = 2
+	OptionBlockWiseTransfer  OptionNumber = 4
+	OptionCustody            OptionNumber = 2
+	OptionAlternativeAddress OptionNumber = 2
+	OptionHoldOff            OptionNumber = 4
+	OptionBadCSMOption       OptionNumber = 2
 )
 
 // ContentFormatLinkFormat identifies application/link-format.

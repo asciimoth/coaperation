@@ -53,7 +53,7 @@ func TestBlockValidationAndReassemblyErrors(t *testing.T) {
 	if err != nil || b != (Block{Number: 1, More: true, Size: 32}) {
 		t.Fatalf("ParseBlock = %#v, %v", b, err)
 	}
-	for _, b := range []Block{{Number: MaxBlockNumber + 1, Size: 16}, {Size: 15}, {Size: 24}, {Size: 2048}} {
+	for _, b := range []Block{{Number: MaxBlockNumber + 1, Size: 16}, {Size: 0}, {Size: 15}, {Size: 24}, {Size: 2048}} {
 		if _, err := b.Option(OptionBlock1); err == nil {
 			t.Fatalf("Option accepted %#v", b)
 		}
@@ -69,6 +69,11 @@ func TestBlockValidationAndReassemblyErrors(t *testing.T) {
 	var r BlockReassembler
 	if body, ok := r.Body(); ok || body != nil {
 		t.Fatal("incomplete body is available")
+	}
+	for _, b := range []Block{{Number: MaxBlockNumber + 1, Size: 16}, {Size: 0}, {Size: 15}, {Size: 24}, {Size: 2048}} {
+		if _, err := r.Add(b, nil); err == nil {
+			t.Fatalf("reassembler accepted invalid block %#v", b)
+		}
 	}
 	if _, err := r.Add(Block{Number: 1, Size: 16}, nil); err == nil {
 		t.Fatal("accepted a nonsequential block")

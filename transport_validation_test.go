@@ -69,11 +69,16 @@ func TestTCPValidationAndWriteErrors(t *testing.T) {
 		t.Fatal("NewTCPConn accepted nil")
 	}
 	a, b := net.Pipe()
-	if _, err := NewTCPConn(a, TCPConfig{MaxMessageSize: 100}); err == nil {
+	if _, err := NewTCPConn(a, TCPConfig{MaxMessageSize: 1}); err == nil {
 		t.Fatal("NewTCPConn accepted a small maximum")
 	}
 	_ = a.Close()
 	_ = b.Close()
+	if conn, err := NewTCPConn(&stubConn{}, TCPConfig{MaxMessageSize: 100}); err != nil {
+		t.Fatalf("NewTCPConn rejected a valid small maximum: %v", err)
+	} else {
+		_ = conn.Close()
+	}
 	if _, err := DialTCP(context.Background(), "tcp", "invalid address", TCPConfig{}); err == nil {
 		t.Fatal("DialTCP accepted an invalid address")
 	}
@@ -95,6 +100,9 @@ func TestTCPValidationAndWriteErrors(t *testing.T) {
 	if err := c.Send(&Message{Code: GET, Payload: make([]byte, 1200)}); err == nil {
 		t.Fatal("Send ignored the peer maximum")
 	}
+	if err := c.Send(&Message{Code: CSM, Payload: make([]byte, 1200)}); err == nil {
+		t.Fatal("signaling Send ignored the peer maximum")
+	}
 	c.cfg.MaxMessageSize = 20
 	if err := c.write(&Message{Code: CSM, Payload: make([]byte, 30)}, false); err == nil {
 		t.Fatal("write ignored the local maximum")
@@ -114,6 +122,13 @@ func TestTCPValidationAndWriteErrors(t *testing.T) {
 }
 
 func TestTCPRequestAndSignalValidation(t *testing.T) {
+	noHandlerRaw := &stubConn{}
+	noHandler := bareTCP(noHandlerRaw)
+	noHandler.handleRequest(&Message{Code: GET, Token: []byte{1}})
+	missingHandlerResponse, err := UnmarshalTCP(noHandlerRaw.Bytes(), 0)
+	if err != nil || missingHandlerResponse.Code != NotImplemented || !bytes.Equal(missingHandlerResponse.Token, []byte{1}) {
+		t.Fatalf("missing handler response = %#v, %v", missingHandlerResponse, err)
+	}
 	c := bareTCP(&stubConn{})
 	if _, err := c.Request(context.Background(), nil); err == nil {
 		t.Fatal("Request accepted nil")
@@ -134,6 +149,20 @@ func TestTCPRequestAndSignalValidation(t *testing.T) {
 	if !ready || capabilities.MaxMessageSize != 4096 || !capabilities.BlockWiseTransfer {
 		t.Fatalf("capabilities = %#v, ready=%v", capabilities, ready)
 	}
+	if !c.handleSignal(&Message{Code: CSM}) {
+		t.Fatal("empty later CSM stopped the connection")
+	}
+	capabilities, _ = c.Capabilities()
+	if capabilities.MaxMessageSize != 4096 || !capabilities.BlockWiseTransfer {
+		t.Fatalf("empty later CSM reset capabilities: %#v", capabilities)
+	}
+	if !c.handleSignal(&Message{Code: CSM, Options: []Option{UintOption(OptionMaxMessageSize, 2048)}}) {
+		t.Fatal("updated CSM stopped the connection")
+	}
+	capabilities, _ = c.Capabilities()
+	if capabilities.MaxMessageSize != 2048 || !capabilities.BlockWiseTransfer {
+		t.Fatalf("updated CSM reset block-wise capability: %#v", capabilities)
+	}
 	responses := make(chan *Message, 1)
 	c.pending["token"] = responses
 	if !c.handleSignal(&Message{Code: Pong, Token: []byte("token")}) {
@@ -147,6 +176,14 @@ func TestTCPRequestAndSignalValidation(t *testing.T) {
 	if !c.handleSignal(&Message{Code: Pong, Token: []byte("absent")}) {
 		t.Fatal("unmatched Pong stopped the connection")
 	}
+	if !c.handleSignal(&Message{Code: Ping, Token: []byte("ping"), Options: []Option{NewOption(OptionCustody, nil)}}) {
+		t.Fatal("Ping stopped the connection")
+	}
+	pong, err := UnmarshalTCP(c.conn.(*stubConn).Bytes(), 0)
+	if err != nil || pong.Code != Pong || string(pong.Token) != "ping" || len(pong.Options) != 0 {
+		t.Fatalf("Pong with unearned Custody = %#v, error = %v", pong, err)
+	}
+	c.conn.(*stubConn).Reset()
 
 	invalid := bareTCP(&stubConn{})
 	if invalid.handleSignal(&Message{Code: CSM, Options: []Option{UintOption(OptionMaxMessageSize, 0)}}) {
@@ -154,6 +191,24 @@ func TestTCPRequestAndSignalValidation(t *testing.T) {
 	}
 	if invalid.closedError() == nil {
 		t.Fatal("invalid CSM did not close the connection")
+	}
+	for _, signal := range []*Message{
+		{Code: CSM, Options: []Option{NewOption(OptionBlockWiseTransfer, []byte{1})}},
+		{Code: CSM, Options: []Option{NewOption(3, nil)}},
+		{Code: Ping, Options: []Option{NewOption(3, nil)}},
+	} {
+		invalid = bareTCP(&stubConn{})
+		if invalid.handleSignal(signal) {
+			t.Fatalf("invalid signaling message continued: %#v", signal)
+		}
+		select {
+		case <-invalid.closed:
+		default:
+			t.Fatalf("invalid signaling message did not close: %#v", signal)
+		}
+	}
+	if !c.handleSignal(&Message{Code: CSM, Options: []Option{NewOption(6, nil)}}) {
+		t.Fatal("unknown elective signaling option stopped the connection")
 	}
 	aborted := bareTCP(&stubConn{})
 	if aborted.handleSignal(&Message{Code: Abort, Payload: []byte("reason")}) {
@@ -166,6 +221,92 @@ func TestTCPRequestAndSignalValidation(t *testing.T) {
 	if released.handleSignal(&Message{Code: Release}) {
 		t.Fatal("Release continued")
 	}
+	select {
+	case <-released.closed:
+	case <-time.After(time.Second):
+		t.Fatal("idle connection did not close after peer Release")
+	}
+}
+
+func TestTCPReleaseWaitsForHandlers(t *testing.T) {
+	raw := &stubConn{}
+	sender := bareTCP(raw)
+	defer func() { _ = sender.Close() }()
+	if err := sender.Release(); err != nil {
+		t.Fatal(err)
+	}
+	message, err := UnmarshalTCP(raw.Bytes(), 0)
+	if err != nil || message.Code != Release {
+		t.Fatalf("sent Release = %#v, %v", message, err)
+	}
+	select {
+	case <-sender.closed:
+		t.Fatal("sender closed before the peer could respond to Release")
+	default:
+	}
+
+	receiver := bareTCP(&stubConn{})
+	receiver.handlers.Add(1)
+	if receiver.handleSignal(&Message{Code: Release}) {
+		t.Fatal("received Release did not stop reading")
+	}
+	select {
+	case <-receiver.closed:
+		t.Fatal("receiver closed while an earlier handler was active")
+	default:
+	}
+	receiver.handlers.Done()
+	select {
+	case <-receiver.closed:
+	case <-time.After(time.Second):
+		t.Fatal("receiver stayed open after the handler finished")
+	}
+}
+
+func FuzzTCPCSMOptions(f *testing.F) {
+	f.Add(byte(2), []byte{0x10, 0})
+	f.Add(byte(2), []byte{})
+	f.Add(byte(4), []byte{})
+	f.Add(byte(4), []byte{1})
+	f.Add(byte(3), []byte{})
+	f.Add(byte(6), []byte{1})
+	f.Fuzz(func(t *testing.T, number byte, value []byte) {
+		if len(value) > 8 {
+			return
+		}
+		c := bareTCP(&stubConn{})
+		defer func() { _ = c.Close() }()
+		c.peer = TCPCapabilities{MaxMessageSize: 4096, BlockWiseTransfer: true}
+		valid := number&1 == 0
+		expectedMax := uint32(4096)
+		switch number {
+		case 2:
+			valid = len(value) <= 4
+			if valid {
+				v, _ := NewOption(OptionMaxMessageSize, value).Uint32()
+				valid = v != 0
+				expectedMax = v
+			}
+		case 4:
+			valid = len(value) == 0
+		}
+		continued := c.handleSignal(&Message{Code: CSM, Options: []Option{NewOption(OptionNumber(number), value)}})
+		if continued != valid {
+			t.Fatalf("CSM option %d with %x: continued = %v", number, value, continued)
+		}
+		if valid {
+			got, ready := c.Capabilities()
+			if !ready || !got.BlockWiseTransfer || got.MaxMessageSize != expectedMax {
+				t.Fatalf("CSM capabilities = %#v, ready = %v", got, ready)
+			}
+		} else {
+			select {
+			case <-c.closed:
+			default:
+				t.Fatal("invalid CSM did not close")
+			}
+		}
+	})
 }
 
 func waitTCPPending(t *testing.T, c *TCPConn) (string, chan *Message) {
@@ -381,7 +522,7 @@ func TestDialAndServeRejectInvalidTCPConfig(t *testing.T) {
 		conn, _ := listener.Accept()
 		accepted <- conn
 	}()
-	if _, err := DialTCP(context.Background(), "tcp", listener.Addr().String(), TCPConfig{MaxMessageSize: 100}); err == nil {
+	if _, err := DialTCP(context.Background(), "tcp", listener.Addr().String(), TCPConfig{MaxMessageSize: 1}); err == nil {
 		t.Fatal("DialTCP accepted an invalid TCP configuration")
 	}
 	if conn := <-accepted; conn != nil {
@@ -394,7 +535,7 @@ func TestDialAndServeRejectInvalidTCPConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- ServeTCP(listener, TCPConfig{MaxMessageSize: 100}, nil) }()
+	go func() { serveDone <- ServeTCP(listener, TCPConfig{MaxMessageSize: 1}, nil) }()
 	client, err := net.Dial("tcp", listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -447,6 +588,40 @@ func TestTCPRejectsNonCSMFirstMessage(t *testing.T) {
 	case <-c.conn.closed:
 	case <-time.After(time.Second):
 		t.Fatal("connection remained open")
+	}
+}
+
+func TestTCPMalformedFrameGetsAbort(t *testing.T) {
+	a, b := net.Pipe()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	type result struct {
+		conn *TCPConn
+		err  error
+	}
+	created := make(chan result, 1)
+	go func() {
+		conn, err := NewTCPConn(a, TCPConfig{})
+		created <- result{conn, err}
+	}()
+	reader := bufio.NewReader(b)
+	if message, err := ReadTCP(reader, 0); err != nil || message.Code != CSM {
+		t.Fatalf("initial message = %#v, %v", message, err)
+	}
+	c := <-created
+	if c.err != nil {
+		t.Fatal(c.err)
+	}
+	if _, err := b.Write([]byte{0x09}); err != nil {
+		t.Fatal(err)
+	}
+	abort, err := ReadTCP(reader, 0)
+	if err != nil || abort.Code != Abort {
+		t.Fatalf("malformed frame response = %#v, %v", abort, err)
+	}
+	select {
+	case <-c.conn.closed:
+	case <-time.After(time.Second):
+		t.Fatal("connection remained open after malformed frame")
 	}
 }
 
@@ -582,7 +757,7 @@ func TestUDPMulticastAndResponseBranches(t *testing.T) {
 
 	p := &udpPending{responses: make(chan *Message, 1), ack: make(chan struct{}, 1), failures: make(chan error, 1), remote: "peer"}
 	e := &UDPEndpoint{pending: map[string]*udpPending{"t": p}, messageACK: make(map[string]*udpPending)}
-	e.handleResponse(&Message{Code: Content, Token: []byte("t"), RemoteAddr: testAddr("wrong")})
+	e.handleResponse(&Message{Type: NonConfirmable, Code: Content, Token: []byte("t"), RemoteAddr: testAddr("wrong")})
 	select {
 	case <-p.responses:
 		t.Fatal("accepted a response from the wrong peer")
@@ -598,6 +773,162 @@ func TestUDPMulticastAndResponseBranches(t *testing.T) {
 	default:
 		t.Fatal("reset was not dispatched")
 	}
+}
+
+func TestUDPEmptyConfirmableGetsReset(t *testing.T) {
+	a, b := memoryPacketPair()
+	e, err := NewUDPEndpoint(a, UDPConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Close(); _ = b.Close() }()
+	wire, err := MarshalUDP(&Message{Type: Confirmable, Code: CodeEmpty, MessageID: 0x1234})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.WriteTo(wire, a.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case packet := <-b.reads:
+		response, err := UnmarshalUDP(packet.data)
+		if err != nil || response.Type != Reset || response.Code != CodeEmpty || response.MessageID != 0x1234 {
+			t.Fatalf("reset = %#v, error = %v", response, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no reset for Empty Confirmable message")
+	}
+}
+
+func TestUDPMalformedConfirmableGetsReset(t *testing.T) {
+	a, b := memoryPacketPair()
+	errorsSeen := make(chan error, 2)
+	e, err := NewUDPEndpoint(a, UDPConfig{ErrorHandler: func(err error) { errorsSeen <- err }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Close(); _ = b.Close() }()
+	for _, wire := range [][]byte{
+		{0x49, byte(GET), 0x12, 0x34},       // Reserved token length.
+		{0x40, byte(GET), 0x12, 0x35, 0xff}, // Empty payload marker.
+	} {
+		if _, err := b.WriteTo(wire, a.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case packet := <-b.reads:
+			reset, err := UnmarshalUDP(packet.data)
+			if err != nil || reset.Type != Reset || reset.MessageID != uint16(wire[2])<<8|uint16(wire[3]) {
+				t.Fatalf("malformed request reset = %#v, error = %v", reset, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("no Reset for malformed Confirmable datagram")
+		}
+		select {
+		case <-errorsSeen:
+		case <-time.After(time.Second):
+			t.Fatal("malformed datagram error was not reported")
+		}
+	}
+}
+
+func TestUDPPiggybackedACKRequiresMessageID(t *testing.T) {
+	e := &UDPEndpoint{pending: make(map[string]*udpPending), messageACK: make(map[string]*udpPending)}
+	p := &udpPending{responses: make(chan *Message, 1), ack: make(chan struct{}, 1), remote: "peer"}
+	if err := e.addPending("token", 17, p); err != nil {
+		t.Fatal(err)
+	}
+	e.handleResponse(&Message{Type: Acknowledgement, Code: Content, MessageID: 18, Token: []byte("token"), RemoteAddr: testAddr("peer")})
+	select {
+	case <-p.responses:
+		t.Fatal("accepted an ACK with the wrong Message ID")
+	default:
+	}
+	e.handleResponse(&Message{Type: Acknowledgement, Code: Content, MessageID: 17, Token: []byte("token"), RemoteAddr: testAddr("peer")})
+	select {
+	case response := <-p.responses:
+		if response.MessageID != 17 {
+			t.Fatalf("response Message ID = %d", response.MessageID)
+		}
+	default:
+		t.Fatal("matching ACK was not dispatched")
+	}
+}
+
+func TestUDPResponseDeduplicationAndUnexpectedReset(t *testing.T) {
+	a, b := memoryPacketPair()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	e := &UDPEndpoint{
+		conn: a, cfg: UDPConfig{MaxDatagramSize: 65535, ExchangeLifetime: time.Minute},
+		pending: make(map[string]*udpPending), messageACK: make(map[string]*udpPending),
+		duplicates: make(map[string]duplicateEntry), responseDuplicates: make(map[string]duplicateEntry),
+	}
+	p := &udpPending{responses: make(chan *Message, 1), ack: make(chan struct{}, 1), remote: "peer"}
+	if err := e.addPending("token", 10, p); err != nil {
+		t.Fatal(err)
+	}
+	response := &Message{Type: Confirmable, Code: Content, Token: []byte("token"), MessageID: 20, RemoteAddr: testAddr("peer")}
+	e.handleResponse(response)
+	first := <-b.reads
+	ack, err := UnmarshalUDP(first.data)
+	if err != nil || ack.Type != Acknowledgement || ack.MessageID != 20 {
+		t.Fatalf("response ACK = %#v, error = %v", ack, err)
+	}
+	if got := <-p.responses; got.MessageID != 20 {
+		t.Fatalf("delivered response Message ID = %d", got.MessageID)
+	}
+	e.removePending("token", 10)
+	e.handleResponse(response)
+	repeated := <-b.reads
+	if !bytes.Equal(repeated.data, first.data) {
+		t.Fatalf("duplicate response ACK %x differs from %x", repeated.data, first.data)
+	}
+	unexpected := response.Clone()
+	unexpected.MessageID = 21
+	e.handleResponse(unexpected)
+	reset := <-b.reads
+	message, err := UnmarshalUDP(reset.data)
+	if err != nil || message.Type != Reset || message.MessageID != 21 {
+		t.Fatalf("unexpected response Reset = %#v, error = %v", message, err)
+	}
+	multi := &udpPending{multi: true, notify: make(chan struct{}, 1)}
+	e.pending["multi"] = multi
+	non := &Message{Type: NonConfirmable, Code: Content, Token: []byte("multi"), MessageID: 30, RemoteAddr: testAddr("other")}
+	e.handleResponse(non)
+	e.handleResponse(non)
+	if multi.dequeue() == nil || multi.dequeue() != nil {
+		t.Fatal("duplicate NON response was delivered more than once")
+	}
+}
+
+func FuzzUDPMulticastResponseDeduplication(f *testing.F) {
+	f.Add([]byte{0, 1, 0, 1, 1, 1, 0, 2})
+	f.Add([]byte{1, 255, 0, 0, 1, 255})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 128 {
+			return
+		}
+		p := &udpPending{multi: true, notify: make(chan struct{}, 1)}
+		e := &UDPEndpoint{
+			cfg: UDPConfig{ExchangeLifetime: time.Minute}, pending: map[string]*udpPending{"token": p},
+			responseDuplicates: make(map[string]duplicateEntry),
+		}
+		seen := make(map[[2]byte]bool)
+		for i := 0; i+1 < len(data); i += 2 {
+			peer := data[i] % 2
+			mid := data[i+1]
+			seen[[2]byte{peer, mid}] = true
+			e.handleResponse(&Message{Type: NonConfirmable, Code: Content, Token: []byte("token"), MessageID: uint16(mid), RemoteAddr: testAddr(string([]byte{'a' + peer}))})
+		}
+		for range len(seen) {
+			if p.dequeue() == nil {
+				t.Fatal("lost a distinct NON response")
+			}
+		}
+		if p.dequeue() != nil {
+			t.Fatal("delivered a duplicate NON response")
+		}
+	})
 }
 
 func TestUDPPendingCollisionsAndClosedError(t *testing.T) {
@@ -785,6 +1116,72 @@ func TestUDPRequestHandlerBranches(t *testing.T) {
 		t.Fatal("sent an oversized handler response")
 	default:
 	}
+}
+
+func TestUDPNonConfirmableRequestDeduplication(t *testing.T) {
+	a, b := memoryPacketPair()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	e := &UDPEndpoint{
+		conn: a, cfg: UDPConfig{Handler: HandlerFunc(func(context.Context, *Message) (*Message, error) {
+			calls++
+			return nil, nil
+		}), MaxDatagramSize: 65535, ExchangeLifetime: time.Minute},
+		duplicates: make(map[string]duplicateEntry), closed: make(chan struct{}), ctx: ctx, cancel: cancel,
+	}
+	request := &Message{Type: NonConfirmable, Code: POST, MessageID: 10, RemoteAddr: testAddr("peer-a")}
+	e.handleRequest(request)
+	e.handleRequest(request)
+	if calls != 1 {
+		t.Fatalf("duplicate NON request reached handler %d times", calls)
+	}
+	otherPeer := request.Clone()
+	otherPeer.RemoteAddr = testAddr("peer-b")
+	e.handleRequest(otherPeer)
+	otherID := request.Clone()
+	otherID.MessageID++
+	e.handleRequest(otherID)
+	if calls != 3 {
+		t.Fatalf("distinct peer and Message ID calls = %d", calls)
+	}
+	e.mu.Lock()
+	e.duplicates["peer-a/10"] = duplicateEntry{expires: time.Now().Add(-time.Second)}
+	e.mu.Unlock()
+	e.handleRequest(request)
+	e.handleRequest(request)
+	if calls != 4 {
+		t.Fatalf("expired NON request was not processed once: %d", calls)
+	}
+}
+
+func FuzzUDPNonConfirmableDeduplication(f *testing.F) {
+	f.Add([]byte{0, 1, 0, 1, 1, 1, 0, 2})
+	f.Add([]byte{0, 0, 0, 255, 1, 0, 0, 0})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 128 {
+			return
+		}
+		calls := 0
+		e := &UDPEndpoint{
+			cfg: UDPConfig{ExchangeLifetime: time.Minute, Handler: HandlerFunc(func(context.Context, *Message) (*Message, error) {
+				calls++
+				return nil, nil
+			})},
+			duplicates: make(map[string]duplicateEntry),
+		}
+		seen := make(map[[2]byte]bool)
+		for i := 0; i+1 < len(data); i += 2 {
+			peer := data[i] % 2
+			mid := data[i+1]
+			seen[[2]byte{peer, mid}] = true
+			e.handleRequest(&Message{Type: NonConfirmable, Code: POST, MessageID: uint16(mid), RemoteAddr: testAddr(string([]byte{'a' + peer}))})
+		}
+		if calls != len(seen) {
+			t.Fatalf("handled %d requests for %d peer/Message ID pairs", calls, len(seen))
+		}
+	})
 }
 
 func TestUDPRequestHandlerWriteFailures(t *testing.T) {

@@ -34,13 +34,13 @@ test:
   go test -race -cover ./...
 
 # Run each Go fuzz target. The duration applies to each target.
-fuzz fuzztime=env_var_or_default('FUZZ_TIME', '5s'):
+fuzz fuzztime=env_var_or_default('FUZZ_TIME', '5s') fuzzparallel=env_var_or_default('FUZZ_PARALLEL', '2'):
   @found=0; \
   while IFS=: read -r file _ target; do \
     found=1; \
     package="./$(dirname "$file")"; \
     printf 'Fuzzing %s in %s for %s\n' "$target" "$package" {{quote(fuzztime)}}; \
-    go test "$package" -run '^$' -fuzz "^${target}$" -fuzztime {{quote(fuzztime)}}; \
+    go test "$package" -run '^$' -fuzz "^${target}$" -fuzztime {{quote(fuzztime)}} -parallel {{quote(fuzzparallel)}}; \
   done < <(rg --line-number --no-heading --replace '$1' '^func (Fuzz[[:alnum:]_]+)\(.*$' --glob '*_test.go'); \
   if ((found == 0)); then printf 'No Go fuzz targets found.\n'; fi
 

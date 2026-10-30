@@ -1,6 +1,7 @@
 package coap
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -80,6 +81,9 @@ func RequestBody(ctx context.Context, requester Requester, request *Message, con
 	if err != nil {
 		return nil, err
 	}
+	if response == nil {
+		return nil, errors.New("coap: requester returned no response")
+	}
 	return receiveBlock2(ctx, requester, request, response)
 }
 
@@ -103,11 +107,14 @@ func sendBlock1(ctx context.Context, requester Requester, request *Message, bloc
 		if err != nil {
 			return nil, err
 		}
+		if response == nil {
+			return nil, errors.New("coap: requester returned no Block1 response")
+		}
 		if response.Code == RequestEntityIncomplete || response.Code == RequestEntityTooLarge {
 			return response, fmt.Errorf("coap: Block1 transfer rejected with %s", response.Code)
 		}
-		if more && response.Code != Continue {
-			return response, fmt.Errorf("coap: expected 2.31 Continue, got %s", response.Code)
+		if !more && response.Code == Continue {
+			return response, errors.New("coap: final Block1 response is 2.31 Continue")
 		}
 		offset = end
 		acknowledged, hasAcknowledgement := response.Option(OptionBlock1)
@@ -118,6 +125,14 @@ func sendBlock1(ctx context.Context, requester Requester, request *Message, bloc
 			accepted, err := ParseBlock(acknowledged.Value)
 			if err != nil {
 				return nil, err
+			}
+			if more {
+				switch {
+				case response.Code == Continue && accepted.More && len(response.Payload) == 0:
+				case response.Code.Class() == 2 && response.Code != Continue && !accepted.More:
+				default:
+					return response, fmt.Errorf("coap: invalid response %s to non-final Block1 request", response.Code)
+				}
 			}
 			if accepted.Size > blockSize {
 				return nil, errors.New("coap: server increased Block1 size")
@@ -134,6 +149,9 @@ func sendBlock1(ctx context.Context, requester Requester, request *Message, bloc
 }
 
 func receiveBlock2(ctx context.Context, requester Requester, original, first *Message) (*Message, error) {
+	if first == nil {
+		return nil, errors.New("coap: requester returned no Block2 response")
+	}
 	option, ok := first.Option(OptionBlock2)
 	if !ok {
 		return first, nil
@@ -143,6 +161,8 @@ func receiveBlock2(ctx context.Context, requester Requester, original, first *Me
 		return nil, err
 	}
 	var reassembler BlockReassembler
+	etags := first.OptionValues(OptionETag)
+	contentFormats := first.OptionValues(OptionContentFormat)
 	var expectedSize uint32
 	var hasExpectedSize bool
 	if size, present := first.Option(OptionSize2); present {
@@ -171,6 +191,18 @@ func receiveBlock2(ctx context.Context, requester Requester, original, first *Me
 		response, err = requester.Request(ctx, request)
 		if err != nil {
 			return nil, err
+		}
+		if response == nil {
+			return nil, errors.New("coap: requester returned no Block2 response")
+		}
+		if response.Code != first.Code {
+			return nil, errors.New("coap: response code changed during Block2 transfer")
+		}
+		if !sameOptionValues(etags, response.OptionValues(OptionETag)) {
+			return nil, errors.New("coap: ETag changed during Block2 transfer")
+		}
+		if !sameOptionValues(contentFormats, response.OptionValues(OptionContentFormat)) {
+			return nil, errors.New("coap: Content-Format changed during Block2 transfer")
 		}
 		got, present := response.Option(OptionBlock2)
 		if !present {
@@ -203,6 +235,18 @@ func receiveBlock2(ctx context.Context, requester Requester, original, first *Me
 	result.Payload = body
 	result.Options = withoutOptions(first.Options, OptionBlock2)
 	return result, nil
+}
+
+func sameOptionValues(a, b [][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !bytes.Equal(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func withoutOptions(options []Option, numbers ...OptionNumber) []Option {

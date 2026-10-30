@@ -36,8 +36,7 @@ func MarshalTCP(m *Message) ([]byte, error) {
 	if err := validateToken(m.Token); err != nil {
 		return nil, err
 	}
-	body := []byte{byte(m.Code)}
-	body = append(body, m.Token...)
+	body := make([]byte, 0, len(m.Payload)+16)
 	var err error
 	body, err = marshalOptions(body, m.Options)
 	if err != nil {
@@ -51,6 +50,8 @@ func MarshalTCP(m *Message) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	header = append(header, byte(m.Code))
+	header = append(header, m.Token...)
 	return append(header, body...), nil
 }
 
@@ -92,18 +93,22 @@ func ReadTCP(r *bufio.Reader, maxSize uint64) (*Message, error) {
 		length = uint64(binary.BigEndian.Uint32(b[:])) + 65805
 		headerSize += 4
 	}
-	if length < uint64(1+tkl) {
-		return nil, errors.New("coap: TCP message length is shorter than code and token")
+	bodyLength := length + uint64(1+tkl)
+	if maxSize != 0 && bodyLength+headerSize > maxSize {
+		return nil, fmt.Errorf("coap: TCP message size %d exceeds limit %d", bodyLength+headerSize, maxSize)
 	}
-	if maxSize != 0 && length+headerSize > maxSize {
-		return nil, fmt.Errorf("coap: TCP message size %d exceeds limit %d", length+headerSize, maxSize)
-	}
-	if length > uint64(int(^uint(0)>>1)) {
+	if bodyLength > uint64(int(^uint(0)>>1)) {
 		return nil, errors.New("coap: TCP message is too large for this platform")
 	}
-	body := make([]byte, int(length))
-	if _, err := io.ReadFull(r, body); err != nil {
-		return nil, err
+	body := make([]byte, 0, min(int(bodyLength), 4096))
+	var chunk [4096]byte
+	for uint64(len(body)) < bodyLength {
+		n := min(int(bodyLength-uint64(len(body))), len(chunk))
+		read, err := io.ReadFull(r, chunk[:n])
+		body = append(body, chunk[:read]...)
+		if err != nil {
+			return nil, err
+		}
 	}
 	m := &Message{Code: Code(body[0]), Token: append([]byte(nil), body[1:1+tkl]...)}
 	m.Options, m.Payload, err = unmarshalOptions(body[1+tkl:])
