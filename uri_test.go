@@ -22,3 +22,26 @@ func TestNewRequestPreservesURIComponents(t *testing.T) {
 		t.Fatalf("queries %x", queries)
 	}
 }
+
+func TestNewRequestValidation(t *testing.T) {
+	for _, rawURI := range []string{
+		"coap://%", "http://example.test", "coap://user@example.test",
+		"coap://example.test/x#fragment", "coap:///path", "coap://example.test:0",
+		"coap://example.test:65536", "coap://example.test:bad",
+		"coap://example.test/?query=%ZZ",
+	} {
+		if _, _, err := NewRequest(GET, rawURI, nil); err == nil {
+			t.Fatalf("NewRequest accepted %q", rawURI)
+		}
+	}
+	if _, _, err := NewRequest(Content, "coap://example.test", nil); err == nil {
+		t.Fatal("NewRequest accepted a response code")
+	}
+	m, target, err := NewRequest(GET, "coap://example.test/", []byte("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Address() != "example.test:5683" || len(m.URIPath()) != 0 || string(m.Payload) != "body" {
+		t.Fatalf("request = %#v, target = %#v", m, target)
+	}
+}
