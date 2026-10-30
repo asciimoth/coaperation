@@ -10,8 +10,8 @@ discard repeated URI options. Option values are byte slices, so binary
 
 ## Network I/O abstraction
 
-Protocol state is independent of concrete sockets. A UDP endpoint needs only
-the small `coap.PacketConn` interface:
+Protocol state is independent of concrete sockets. A UDP endpoint needs only the
+small `coap.PacketConn` interface:
 
 ```go
 type PacketConn interface {
@@ -47,8 +47,8 @@ if err != nil {
 defer server.Close()
 ```
 
-The `ListenUDP` helper creates the socket when direct I/O control is not
-needed. A client endpoint uses the same abstraction:
+The `ListenUDP` helper creates the socket when direct I/O control is not needed.
+A client endpoint uses the same abstraction:
 
 ```go
 socket, err := net.ListenPacket("udp", ":0")
