@@ -1,6 +1,7 @@
 package linkformat
 
 import (
+	"bytes"
 	"reflect"
 	"testing"
 )
@@ -57,6 +58,7 @@ func TestParseValidation(t *testing.T) {
 	invalid := []string{
 		"x", "<x", "<<x>", "<x> trailing", "<x>;", "<x>;*=x", "<x>;a**=x",
 		"<x>;a=", "<x>;a=\"unterminated", "<x>;a=\"bad\\q\"", "<x>;a=\"bad\\",
+		"<x y>", "<x%ZZ>", "<x\n>", string([]byte{'<', 0xff, '>'}),
 	}
 	for _, input := range invalid {
 		if _, err := Parse([]byte(input)); err == nil {
@@ -68,6 +70,9 @@ func TestParseValidation(t *testing.T) {
 func TestMarshalValidationAndValues(t *testing.T) {
 	invalid := []Link{
 		{Target: "<x>"},
+		{Target: "x y"},
+		{Target: "x%ZZ"},
+		{Target: string([]byte{0xff})},
 		{Target: "x", Attributes: []Attribute{{}}},
 		{Target: "x", Attributes: []Attribute{{Name: "bad name"}}},
 		{Target: "x", Attributes: []Attribute{{Name: "*"}}},
@@ -105,6 +110,27 @@ func FuzzParse(f *testing.F) {
 		got, err := Parse(wire)
 		if err != nil || !reflect.DeepEqual(got, links) {
 			t.Fatalf("link-format round trip changed parsed links: got %#v, want %#v, error %v", got, links, err)
+		}
+	})
+}
+
+func FuzzLinkTargetURIReference(f *testing.F) {
+	f.Add([]byte("/sensors/temp"))
+	f.Add([]byte("coap://example.test/x,y"))
+	f.Add([]byte("x y"))
+	f.Add([]byte("x%ZZ"))
+	f.Add([]byte{0xff})
+	f.Fuzz(func(t *testing.T, target []byte) {
+		if len(target) > 128 || bytes.ContainsAny(target, "<>") {
+			return
+		}
+		links, parseErr := Parse(append(append([]byte{'<'}, target...), '>'))
+		wire, marshalErr := Marshal([]Link{{Target: string(target)}})
+		if (parseErr == nil) != (marshalErr == nil) {
+			t.Fatalf("target %x: parse = %v, marshal = %v", target, parseErr, marshalErr)
+		}
+		if parseErr == nil && (len(links) != 1 || links[0].Target != string(target) || !bytes.Equal(wire, append(append([]byte{'<'}, target...), '>'))) {
+			t.Fatalf("target %x changed: links = %#v, wire = %x", target, links, wire)
 		}
 	})
 }

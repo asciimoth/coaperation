@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"testing"
 	"time"
@@ -18,6 +19,13 @@ type stubConn struct {
 }
 
 type errorWritePacketConn struct{ *memoryPacketConn }
+
+type multicastMemoryPacketConn struct{ *memoryPacketConn }
+
+func (c multicastMemoryPacketConn) ReadPacket(data []byte) (int, net.Addr, net.Addr, bool, error) {
+	n, remote, err := c.ReadFrom(data)
+	return n, c.LocalAddr(), remote, true, err
+}
 
 func (c errorWritePacketConn) WriteTo([]byte, net.Addr) (int, error) {
 	return 0, io.ErrClosedPipe
@@ -163,6 +171,16 @@ func TestTCPRequestAndSignalValidation(t *testing.T) {
 	if capabilities.MaxMessageSize != 2048 || !capabilities.BlockWiseTransfer {
 		t.Fatalf("updated CSM reset block-wise capability: %#v", capabilities)
 	}
+	if !c.handleSignal(&Message{Code: CSM, Options: []Option{
+		UintOption(OptionMaxMessageSize, 1024), NewOption(OptionMaxMessageSize, []byte{0xff, 0xff, 0xff, 0xff, 0xff}),
+		NewOption(OptionBlockWiseTransfer, nil), NewOption(OptionBlockWiseTransfer, []byte{1}),
+	}}) {
+		t.Fatal("later occurrences of elective CSM options stopped the connection")
+	}
+	capabilities, _ = c.Capabilities()
+	if capabilities.MaxMessageSize != 1024 || !capabilities.BlockWiseTransfer {
+		t.Fatalf("repeated CSM options changed capabilities: %#v", capabilities)
+	}
 	responses := make(chan *Message, 1)
 	c.pending["token"] = responses
 	if !c.handleSignal(&Message{Code: Pong, Token: []byte("token")}) {
@@ -305,6 +323,38 @@ func FuzzTCPCSMOptions(f *testing.F) {
 			default:
 				t.Fatal("invalid CSM did not close")
 			}
+		}
+	})
+}
+
+func FuzzTCPCSMRepeatedCapabilities(f *testing.F) {
+	f.Add(byte(0), uint32(1024), []byte{0xff, 0xff, 0xff, 0xff, 0xff})
+	f.Add(byte(1), uint32(2048), []byte{1})
+	f.Add(byte(0), uint32(1), []byte{})
+	f.Fuzz(func(t *testing.T, number byte, firstValue uint32, secondValue []byte) {
+		if len(secondValue) > 8 {
+			return
+		}
+		c := bareTCP(&stubConn{})
+		defer func() { _ = c.Close() }()
+		var first Option
+		var expected TCPCapabilities
+		if number&1 == 0 {
+			if firstValue == 0 {
+				firstValue = 1
+			}
+			first = UintOption(OptionMaxMessageSize, firstValue)
+			expected = TCPCapabilities{MaxMessageSize: firstValue}
+		} else {
+			first = NewOption(OptionBlockWiseTransfer, nil)
+			expected = TCPCapabilities{MaxMessageSize: 1152, BlockWiseTransfer: true}
+		}
+		if !c.handleSignal(&Message{Code: CSM, Options: []Option{first, NewOption(first.Number, secondValue)}}) {
+			t.Fatal("repeated elective option aborted the connection")
+		}
+		got, ready := c.Capabilities()
+		if !ready || got != expected {
+			t.Fatalf("capabilities = %#v, want %#v", got, expected)
 		}
 	})
 }
@@ -591,6 +641,64 @@ func TestTCPRejectsNonCSMFirstMessage(t *testing.T) {
 	}
 }
 
+func TestTCPIgnoresEmptyKeepalive(t *testing.T) {
+	a, b := net.Pipe()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	type result struct {
+		conn *TCPConn
+		err  error
+	}
+	created := make(chan result, 1)
+	go func() {
+		conn, err := NewTCPConn(a, TCPConfig{})
+		created <- result{conn, err}
+	}()
+	if err := b.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if message, err := ReadTCP(bufio.NewReader(b), 0); err != nil || message.Code != CSM {
+		t.Fatalf("initial CSM = %#v, %v", message, err)
+	}
+	client := <-created
+	if client.err != nil {
+		t.Fatal(client.err)
+	}
+	defer func() { _ = client.conn.Close() }()
+	csm, err := MarshalTCP(&Message{Code: CSM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write(csm); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.conn.peerReady:
+	case <-time.After(time.Second):
+		t.Fatal("peer CSM was not processed")
+	}
+	responses := make(chan *Message, 1)
+	client.conn.mu.Lock()
+	client.conn.pending[""] = responses
+	client.conn.mu.Unlock()
+	for _, code := range []Code{CodeEmpty, Content} {
+		wire, err := MarshalTCP(&Message{Code: code})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Write(wire); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case response := <-responses:
+		if response.Code != Content {
+			t.Fatalf("Empty message reached pending response: %#v", response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("response after Empty message was not delivered")
+	}
+}
+
 func TestTCPMalformedFrameGetsAbort(t *testing.T) {
 	a, b := net.Pipe()
 	defer func() { _ = a.Close(); _ = b.Close() }()
@@ -708,6 +816,34 @@ func TestUDPValidationAndTimeouts(t *testing.T) {
 	}
 }
 
+func TestUDPJitterDoesNotWrap(t *testing.T) {
+	e := &UDPEndpoint{}
+	base := time.Duration(1<<63 - 2)
+	for range 100 {
+		got := e.jitter(base)
+		if got < base {
+			t.Fatalf("ACK jitter wrapped: base = %d, got = %d", base, got)
+		}
+	}
+}
+
+func FuzzUDPDurationFraction(f *testing.F) {
+	f.Add(uint64(0), uint16(0))
+	f.Add(uint64(1), uint16(65535))
+	f.Add(uint64(1<<63-1), uint16(65535))
+	f.Add(uint64(60*60*24*1e9), uint16(32768))
+	f.Fuzz(func(t *testing.T, bits uint64, sample uint16) {
+		base := time.Duration(bits & (1<<63 - 1))
+		got := durationFraction(base, uint64(sample), 65536)
+		want := new(big.Int).SetUint64(uint64(base))
+		want.Mul(want, new(big.Int).SetUint64(uint64(sample)))
+		want.Div(want, new(big.Int).SetUint64(65536))
+		if got != time.Duration(want.Int64()) {
+			t.Fatalf("fraction of %d by %d/65536 = %d, want %s", base, sample, got, want)
+		}
+	})
+}
+
 func TestUDPMulticastAndResponseBranches(t *testing.T) {
 	a, b := memoryPacketPair()
 	server, err := NewUDPEndpoint(a, UDPConfig{Handler: HandlerFunc(func(context.Context, *Message) (*Message, error) {
@@ -797,6 +933,58 @@ func TestUDPEmptyConfirmableGetsReset(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no reset for Empty Confirmable message")
+	}
+}
+
+func TestUDPMulticastIgnoresConfirmableRequest(t *testing.T) {
+	a, b := memoryPacketPair()
+	calls := make(chan MessageType, 2)
+	e, err := NewUDPEndpoint(multicastMemoryPacketConn{a}, UDPConfig{
+		Handler: HandlerFunc(func(_ context.Context, request *Message) (*Message, error) {
+			calls <- request.Type
+			return &Message{Code: Content}, nil
+		}),
+		MulticastLeisure: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Close(); _ = b.Close() }()
+	for _, kind := range []MessageType{Confirmable, NonConfirmable} {
+		wire, err := MarshalUDP(&Message{Type: kind, Code: GET, MessageID: uint16(kind) + 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.WriteTo(wire, a.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case kind := <-calls:
+		if kind != NonConfirmable {
+			t.Fatalf("handler received multicast type %v", kind)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("valid Non-confirmable multicast request was not handled")
+	}
+	select {
+	case kind := <-calls:
+		t.Fatalf("handler received another multicast type %v", kind)
+	default:
+	}
+	select {
+	case packet := <-b.reads:
+		response, err := UnmarshalUDP(packet.data)
+		if err != nil || response.Type != NonConfirmable || response.Code != Content {
+			t.Fatalf("multicast response = %#v, %v", response, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("valid multicast request received no response")
+	}
+	select {
+	case packet := <-b.reads:
+		t.Fatalf("unexpected multicast response: %x", packet.data)
+	default:
 	}
 }
 

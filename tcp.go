@@ -23,7 +23,9 @@ type TCPConfig struct {
 	Handler Handler
 	// MaxMessageSize defaults to 1 MiB and must fit the initial CSM.
 	MaxMessageSize uint32
-	// BlockWiseTransfer includes the capability in the local CSM.
+	// BlockWiseTransfer includes the capability in the local CSM. With
+	// MaxMessageSize greater than 1152, this also advertises BERT support.
+	// The RFC 7959 block helper does not process BERT blocks.
 	BlockWiseTransfer bool
 }
 
@@ -295,6 +297,9 @@ func (c *TCPConn) readLoop() {
 			}
 			continue
 		}
+		if m.Code == CodeEmpty {
+			continue
+		}
 		if m.Code.IsRequest() {
 			c.handlers.Add(1)
 			go func() {
@@ -327,9 +332,15 @@ func (c *TCPConn) handleSignal(m *Message) bool {
 		c.mu.Lock()
 		capabilities := c.peer
 		c.mu.Unlock()
+		seenMaxMessageSize := false
+		seenBlockWiseTransfer := false
 		for _, option := range m.Options {
 			switch option.Number {
 			case OptionMaxMessageSize:
+				if seenMaxMessageSize {
+					continue
+				}
+				seenMaxMessageSize = true
 				v, err := option.Uint32()
 				if err != nil || v == 0 {
 					_ = c.Abort("invalid Max-Message-Size")
@@ -337,6 +348,10 @@ func (c *TCPConn) handleSignal(m *Message) bool {
 				}
 				capabilities.MaxMessageSize = v
 			case OptionBlockWiseTransfer:
+				if seenBlockWiseTransfer {
+					continue
+				}
+				seenBlockWiseTransfer = true
 				if len(option.Value) != 0 {
 					_ = c.Abort("invalid Block-Wise-Transfer option")
 					return false

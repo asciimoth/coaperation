@@ -88,6 +88,41 @@ func TestTCPShortInputWithLargeDeclaredLength(t *testing.T) {
 	}
 }
 
+func TestTCPEmptyMessageShape(t *testing.T) {
+	if message, err := UnmarshalTCP([]byte{0, 0}, 0); err != nil || message.Code != CodeEmpty {
+		t.Fatalf("valid Empty message = %#v, %v", message, err)
+	}
+	for _, message := range []*Message{
+		{Code: CodeEmpty, Token: []byte{1}},
+		{Code: CodeEmpty, Options: []Option{NewOption(1, nil)}},
+		{Code: CodeEmpty, Payload: []byte{1}},
+	} {
+		if _, err := MarshalTCP(message); err == nil {
+			t.Fatalf("encoded malformed Empty message %#v", message)
+		}
+	}
+	for _, wire := range [][]byte{
+		{0x01, 0, 1},
+		{0x10, 0, 0x10},
+		{0x20, 0, 0xff, 1},
+	} {
+		if _, err := UnmarshalTCP(wire, 0); err == nil {
+			t.Fatalf("accepted malformed Empty frame %x", wire)
+		}
+	}
+}
+
+func TestTCPReservedCodeClasses(t *testing.T) {
+	for _, code := range []Code{0x20, 0x3f, 0xc0, 0xdf} {
+		if _, err := MarshalTCP(&Message{Code: code}); err == nil {
+			t.Fatalf("encoded reserved code %s", code)
+		}
+		if _, err := UnmarshalTCP([]byte{0, byte(code)}, 0); err == nil {
+			t.Fatalf("accepted reserved code %s", code)
+		}
+	}
+}
+
 func TestBlockReassemblyWithReducedSize(t *testing.T) {
 	var r BlockReassembler
 	done, err := r.Add(Block{Number: 0, More: true, Size: 32}, bytes.Repeat([]byte{'a'}, 32))
@@ -199,6 +234,55 @@ func FuzzUnmarshalTCP(f *testing.F) {
 		}
 		if _, err := UnmarshalTCP(wire, 1<<20); err != nil {
 			t.Fatalf("cannot read round trip: %v", err)
+		}
+	})
+}
+
+func FuzzTCPEmptyMessageShape(f *testing.F) {
+	f.Add([]byte{}, []byte{}, []byte{})
+	f.Add([]byte{1}, []byte{}, []byte{})
+	f.Add([]byte{}, []byte{0x10}, []byte{})
+	f.Add([]byte{}, []byte{}, []byte{1})
+	f.Fuzz(func(t *testing.T, token, options, payload []byte) {
+		if len(token) > 8 || len(options) > 32 || len(payload) > 32 {
+			return
+		}
+		body := append([]byte(nil), options...)
+		if len(payload) != 0 {
+			body = append(body, 0xff)
+			body = append(body, payload...)
+		}
+		header, err := tcpLengthHeader(uint64(len(body)), len(token))
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire := append(header, byte(CodeEmpty))
+		wire = append(wire, token...)
+		wire = append(wire, body...)
+		message, err := UnmarshalTCP(wire, 0)
+		valid := len(token) == 0 && len(options) == 0 && len(payload) == 0
+		if valid && (err != nil || message.Code != CodeEmpty) || !valid && err == nil {
+			t.Fatalf("Empty frame %x: message = %#v, error = %v", wire, message, err)
+		}
+	})
+}
+
+func FuzzTCPCodeClass(f *testing.F) {
+	for _, code := range []byte{0, 1, 31, 32, 63, 64, 95, 96, 127, 128, 159, 160, 191, 192, 223, 224, 255} {
+		f.Add(code)
+	}
+	f.Fuzz(func(t *testing.T, code byte) {
+		reserved := code>>5 == 1 || code>>5 == 6
+		wire, marshalErr := MarshalTCP(&Message{Code: Code(code)})
+		message, decodeErr := UnmarshalTCP([]byte{0, code}, 0)
+		if reserved {
+			if marshalErr == nil || decodeErr == nil {
+				t.Fatalf("reserved code %x: marshal = %v, decode = %v", code, marshalErr, decodeErr)
+			}
+			return
+		}
+		if marshalErr != nil || decodeErr != nil || message.Code != Code(code) || !bytes.Equal(wire, []byte{0, code}) {
+			t.Fatalf("code %x: wire = %x, message = %#v, marshal = %v, decode = %v", code, wire, message, marshalErr, decodeErr)
 		}
 	})
 }

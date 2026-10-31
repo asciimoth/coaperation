@@ -33,6 +33,12 @@ func MarshalTCP(m *Message) ([]byte, error) {
 	if m == nil {
 		return nil, errors.New("coap: nil message")
 	}
+	if m.Code.Class() == 1 || m.Code.Class() == 6 {
+		return nil, errors.New("coap: reserved TCP code class")
+	}
+	if m.Code == CodeEmpty && (len(m.Token) != 0 || len(m.Options) != 0 || len(m.Payload) != 0) {
+		return nil, errors.New("coap: empty TCP message has token, options, or payload")
+	}
 	if err := validateToken(m.Token); err != nil {
 		return nil, err
 	}
@@ -111,9 +117,15 @@ func ReadTCP(r *bufio.Reader, maxSize uint64) (*Message, error) {
 		}
 	}
 	m := &Message{Code: Code(body[0]), Token: append([]byte(nil), body[1:1+tkl]...)}
+	if m.Code.Class() == 1 || m.Code.Class() == 6 {
+		return nil, errors.New("coap: reserved TCP code class")
+	}
 	m.Options, m.Payload, err = unmarshalOptions(body[1+tkl:])
 	if err != nil {
 		return nil, err
+	}
+	if m.Code == CodeEmpty && (len(m.Token) != 0 || len(m.Options) != 0 || len(m.Payload) != 0) {
+		return nil, errors.New("coap: empty TCP message has token, options, or payload")
 	}
 	return m, nil
 }

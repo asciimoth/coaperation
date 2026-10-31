@@ -95,6 +95,19 @@ func TestSendBlock1Validation(t *testing.T) {
 	}), &Message{Code: PUT, Payload: make([]byte, 16)}, 16); err == nil {
 		t.Fatal("accepted Continue after the final Block1 request")
 	}
+	if _, err := sendBlock1(context.Background(), requesterFunc(func(context.Context, *Message) (*Message, error) {
+		return &Message{Code: Created, Options: []Option{blockOption(t, OptionBlock1, Block{More: true, Size: 16})}}, nil
+	}), &Message{Code: PUT, Payload: make([]byte, 16)}, 16); err == nil {
+		t.Fatal("accepted a final Block1 acknowledgement that expects more blocks")
+	}
+	if _, err := sendBlock1(context.Background(), requesterFunc(func(context.Context, *Message) (*Message, error) {
+		return &Message{Code: Continue, Options: []Option{
+			blockOption(t, OptionBlock1, Block{More: true, Size: 16}),
+			blockOption(t, OptionBlock2, Block{Size: 16}),
+		}}, nil
+	}), request, 16); err == nil {
+		t.Fatal("accepted a provisional Block1 response with Block2")
+	}
 	blocks := 0
 	response, err := sendBlock1(context.Background(), requesterFunc(func(_ context.Context, part *Message) (*Message, error) {
 		option, ok := part.Option(OptionBlock1)
@@ -110,6 +123,21 @@ func TestSendBlock1Validation(t *testing.T) {
 	}), request, 16)
 	if err != nil || response.Code != Created || blocks != 2 {
 		t.Fatalf("stateless Block1 transfer: response = %#v, blocks = %d, error = %v", response, blocks, err)
+	}
+}
+
+func TestBlock1NumberRange(t *testing.T) {
+	body := make([]byte, (int(MaxBlockNumber)+1)*16+1)
+	calls := 0
+	requester := requesterFunc(func(context.Context, *Message) (*Message, error) {
+		calls++
+		return &Message{Code: Continue, Options: []Option{blockOption(t, OptionBlock1, Block{More: true, Size: 16})}}, nil
+	})
+	if _, err := sendBlock1(context.Background(), requester, &Message{Code: PUT, Payload: body}, 16); err == nil || calls != 0 {
+		t.Fatalf("oversized body: calls = %d, error = %v", calls, err)
+	}
+	if _, err := sendBlock1(context.Background(), requester, &Message{Code: PUT, Payload: body}, 32); err == nil || calls != 1 {
+		t.Fatalf("size reduction: calls = %d, error = %v", calls, err)
 	}
 }
 
@@ -364,6 +392,47 @@ func TestBlock2SizeReductionKeepsRequestedOffset(t *testing.T) {
 	}
 }
 
+func TestBlock1SizeReductionAcknowledgesSentNumber(t *testing.T) {
+	body := bytes.Repeat([]byte("a"), 145)
+	h, err := NewBlockWiseHandler(HandlerFunc(func(_ context.Context, request *Message) (*Message, error) {
+		if !bytes.Equal(request.Payload, body) {
+			t.Fatal("handler received the wrong body")
+		}
+		return &Message{Code: Created}, nil
+	}), BlockWiseConfig{BlockSize: 16, MaxBodySize: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var numbers []uint32
+	requester := requesterFunc(func(ctx context.Context, request *Message) (*Message, error) {
+		option, _ := request.Option(OptionBlock1)
+		block, err := ParseBlock(option.Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		numbers = append(numbers, block.Number)
+		response, err := h.ServeCOAP(ctx, request)
+		if len(numbers) == 1 {
+			ackOption, ok := response.Option(OptionBlock1)
+			if !ok {
+				t.Fatal("server omitted Block1 acknowledgement")
+			}
+			ack, parseErr := ParseBlock(ackOption.Value)
+			if parseErr != nil || ack.Number != 0 || ack.Size != 16 {
+				t.Fatalf("first acknowledgement = %#v, %v", ack, parseErr)
+			}
+		}
+		return response, err
+	})
+	response, err := RequestBody(context.Background(), requester, &Message{Code: PUT, Payload: body}, TransferConfig{Mode: TransferBlockWise, BlockSize: 64})
+	if err != nil || response.Code != Created {
+		t.Fatalf("response = %#v, error = %v", response, err)
+	}
+	if len(numbers) != 7 || numbers[0] != 0 || numbers[1] != 4 || numbers[len(numbers)-1] != 9 {
+		t.Fatalf("request block numbers = %v", numbers)
+	}
+}
+
 func TestBlockWiseTransferIdentity(t *testing.T) {
 	var body []byte
 	h, err := NewBlockWiseHandler(HandlerFunc(func(_ context.Context, request *Message) (*Message, error) {
@@ -418,6 +487,49 @@ func FuzzBlockWiseRequestBody(f *testing.F) {
 		response, err := RequestBody(context.Background(), localRequester{handler: h}, &Message{Code: PUT, Payload: body}, TransferConfig{Mode: TransferBlockWise, BlockSize: 256})
 		if err != nil || response == nil || response.Code != Content || !bytes.Equal(response.Payload, body) {
 			t.Fatalf("block-wise round trip: response = %#v, error = %v", response, err)
+		}
+	})
+}
+
+func FuzzBlock1ResponseControl(f *testing.F) {
+	f.Add(byte(0), []byte("short"), byte(0))
+	f.Add(byte(1), bytes.Repeat([]byte("x"), 100), byte(1))
+	f.Add(byte(2), bytes.Repeat([]byte("y"), 200), byte(2))
+	f.Add(byte(3), bytes.Repeat([]byte("z"), 512), byte(3))
+	f.Fuzz(func(t *testing.T, sizeByte byte, body []byte, flags byte) {
+		if len(body) == 0 || len(body) > 512 {
+			return
+		}
+		size := 16 << (sizeByte % 4)
+		calls := 0
+		response, err := sendBlock1(context.Background(), requesterFunc(func(_ context.Context, part *Message) (*Message, error) {
+			calls++
+			option, ok := part.Option(OptionBlock1)
+			if !ok {
+				t.Fatal("request has no Block1 option")
+			}
+			block, parseErr := ParseBlock(option.Value)
+			if parseErr != nil || block.Offset() != uint64((calls-1)*size) {
+				t.Fatalf("wrong block offset: %#v, %v", block, parseErr)
+			}
+			if block.More != (calls*size < len(body)) {
+				t.Fatal("wrong request More flag")
+			}
+			ack := block
+			ack.More = block.More || flags&1 != 0
+			code := Created
+			if block.More {
+				code = Continue
+			}
+			options := []Option{blockOption(t, OptionBlock1, ack)}
+			if block.More && flags&2 != 0 {
+				options = append(options, blockOption(t, OptionBlock2, Block{Size: 16}))
+			}
+			return &Message{Code: code, Options: options}, nil
+		}), &Message{Code: PUT, Payload: body}, size)
+		invalid := flags&1 != 0 || flags&2 != 0 && len(body) > size
+		if invalid && err == nil || !invalid && (err != nil || response == nil || response.Code != Created || calls != (len(body)+size-1)/size) {
+			t.Fatalf("calls = %d, response = %#v, error = %v, invalid = %v", calls, response, err, invalid)
 		}
 	})
 }

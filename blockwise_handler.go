@@ -134,8 +134,7 @@ func (h *BlockWiseHandler) ServeCOAP(ctx context.Context, request *Message) (*Me
 			if acceptedSize > h.config.BlockSize {
 				acceptedSize = h.config.BlockSize
 			}
-			ackNumber := uint32((block.Offset()+uint64(len(request.Payload)))/uint64(acceptedSize) - 1)
-			ack, _ := (Block{Number: ackNumber, More: true, Size: acceptedSize}).Option(OptionBlock1)
+			ack, _ := (Block{Number: block.Number, More: true, Size: acceptedSize}).Option(OptionBlock1)
 			h.mu.Unlock()
 			return &Message{Code: Continue, Options: []Option{ack}}, nil
 		}

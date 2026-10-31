@@ -4,7 +4,9 @@ package linkformat
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
+	"unicode/utf8"
 )
 
 // Attribute is one ordered link attribute. Quoted preserves its wire form.
@@ -86,6 +88,9 @@ func (p *parser) link() (Link, error) {
 		return Link{}, p.err("unterminated link target")
 	}
 	link := Link{Target: p.s[start:p.i]}
+	if err := validateTarget(link.Target); err != nil {
+		return Link{}, p.err("invalid link target")
+	}
 	p.i++
 	for {
 		p.space()
@@ -152,12 +157,27 @@ func isPToken(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("!#$%&'()*+-./:<=>?@[]^_`{|}~", rune(c))
 }
 
+func validateTarget(target string) error {
+	if !utf8.ValidString(target) {
+		return errors.New("linkformat: link target is not UTF-8")
+	}
+	for i := range target {
+		if target[i] <= ' ' || target[i] == 0x7f || target[i] == '<' || target[i] == '>' {
+			return errors.New("linkformat: invalid link target byte")
+		}
+	}
+	if _, err := url.Parse(target); err != nil {
+		return fmt.Errorf("linkformat: invalid link target: %w", err)
+	}
+	return nil
+}
+
 // Marshal encodes links as an application/link-format document.
 func Marshal(links []Link) ([]byte, error) {
 	var b strings.Builder
 	for i, link := range links {
-		if strings.ContainsAny(link.Target, "<>") {
-			return nil, errors.New("linkformat: target contains angle bracket")
+		if err := validateTarget(link.Target); err != nil {
+			return nil, err
 		}
 		if i != 0 {
 			b.WriteByte(',')

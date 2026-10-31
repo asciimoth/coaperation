@@ -88,6 +88,9 @@ func RequestBody(ctx context.Context, requester Requester, request *Message, con
 }
 
 func sendBlock1(ctx context.Context, requester Requester, request *Message, blockSize int) (*Message, error) {
+	if uint64(len(request.Payload)) > (uint64(MaxBlockNumber)+1)*uint64(blockSize) {
+		return nil, errors.New("coap: request body exceeds Block1 number range")
+	}
 	offset := 0
 	for {
 		if offset%blockSize != 0 {
@@ -99,11 +102,15 @@ func sendBlock1(ctx context.Context, requester Requester, request *Message, bloc
 		}
 		more := end < len(request.Payload)
 		block := Block{Number: uint32(offset / blockSize), More: more, Size: blockSize}
-		option, _ := block.Option(OptionBlock1)
-		part := request.Clone()
+		option, err := block.Option(OptionBlock1)
+		if err != nil {
+			return nil, err
+		}
+		part := *request
+		part.Token = append([]byte(nil), request.Token...)
 		part.Payload = append([]byte(nil), request.Payload[offset:end]...)
-		part.Options = withOptions(part.Options, option, UintOption(OptionSize1, uint32(len(request.Payload))))
-		response, err := requester.Request(ctx, part)
+		part.Options = withOptions(request.Options, option, UintOption(OptionSize1, uint32(len(request.Payload))))
+		response, err := requester.Request(ctx, &part)
 		if err != nil {
 			return nil, err
 		}
@@ -126,9 +133,15 @@ func sendBlock1(ctx context.Context, requester Requester, request *Message, bloc
 			if err != nil {
 				return nil, err
 			}
+			if !more && accepted.More {
+				return nil, errors.New("coap: final Block1 acknowledgement still expects more blocks")
+			}
 			if more {
 				switch {
 				case response.Code == Continue && accepted.More && len(response.Payload) == 0:
+					if _, hasBlock2 := response.Option(OptionBlock2); hasBlock2 {
+						return nil, errors.New("coap: provisional Block1 response has a Block2 option")
+					}
 				case response.Code.Class() == 2 && response.Code != Continue && !accepted.More:
 				default:
 					return response, fmt.Errorf("coap: invalid response %s to non-final Block1 request", response.Code)
@@ -137,8 +150,11 @@ func sendBlock1(ctx context.Context, requester Requester, request *Message, bloc
 			if accepted.Size > blockSize {
 				return nil, errors.New("coap: server increased Block1 size")
 			}
-			if offset%accepted.Size != 0 || accepted.Number != uint32(offset/accepted.Size-1) {
+			if accepted.Number != block.Number {
 				return nil, errors.New("coap: Block1 acknowledgement has an unexpected block number")
+			}
+			if uint64(len(request.Payload)) > (uint64(MaxBlockNumber)+1)*uint64(accepted.Size) {
+				return nil, errors.New("coap: server block-size reduction exceeds Block1 number range")
 			}
 			blockSize = accepted.Size
 		}
@@ -182,13 +198,21 @@ func receiveBlock2(ctx context.Context, requester Requester, original, first *Me
 		if nextOffset%uint64(block.Size) != 0 {
 			return nil, errors.New("coap: Block2 offset is not aligned")
 		}
-		next := Block{Number: uint32(nextOffset / uint64(block.Size)), Size: block.Size}
-		nextOption, _ := next.Option(OptionBlock2)
-		request := original.Clone()
+		nextNumber := nextOffset / uint64(block.Size)
+		if nextNumber > uint64(MaxBlockNumber) {
+			return nil, errors.New("coap: response body exceeds Block2 number range")
+		}
+		next := Block{Number: uint32(nextNumber), Size: block.Size}
+		nextOption, err := next.Option(OptionBlock2)
+		if err != nil {
+			return nil, err
+		}
+		request := *original
+		request.Token = append([]byte(nil), original.Token...)
 		request.Payload = nil
-		request.Options = withoutOptions(request.Options, OptionBlock1, OptionSize1, OptionBlock2)
+		request.Options = withoutOptions(original.Options, OptionBlock1, OptionSize1, OptionBlock2)
 		request.Options = withOptions(request.Options, nextOption)
-		response, err = requester.Request(ctx, request)
+		response, err = requester.Request(ctx, &request)
 		if err != nil {
 			return nil, err
 		}

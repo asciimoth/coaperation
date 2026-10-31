@@ -88,7 +88,7 @@ instrumented connection:
 
 ```go
 conn, err := coap.NewTCPConn(rawConn, coap.TCPConfig{
-	MaxMessageSize:    1 << 20,
+	MaxMessageSize:    1152,
 	BlockWiseTransfer: true,
 	Handler:           handler,
 })
@@ -102,7 +102,10 @@ if err != nil {
 ```
 
 Both sides send CSM immediately. Both sides can send requests on the same
-connection. Responses are matched by token and can arrive out of order.
+connection. Responses are matched by token and can arrive out of order. With
+`BlockWiseTransfer` enabled, a Max-Message-Size above 1152 also advertises BERT
+support. The built-in block helper supports RFC 7959 blocks, so a handler must
+process BERT blocks itself before advertising that capability.
 
 ## Complete and raw block transfers
 

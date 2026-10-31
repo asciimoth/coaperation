@@ -580,7 +580,19 @@ func (e *UDPEndpoint) releasePeer(remote string) {
 func (e *UDPEndpoint) jitter(base time.Duration) time.Duration {
 	var b [2]byte
 	_, _ = rand.Read(b[:])
-	return base + time.Duration(uint64(base)*uint64(binary.BigEndian.Uint16(b[:]))/131072)
+	extra := durationFraction(base, uint64(binary.BigEndian.Uint16(b[:])), 131072)
+	const maxDuration = time.Duration(1<<63 - 1)
+	if base > maxDuration-extra {
+		return maxDuration
+	}
+	return base + extra
+}
+
+// durationFraction scales a nonnegative duration with numerator < denominator.
+func durationFraction(base time.Duration, numerator, denominator uint64) time.Duration {
+	whole := uint64(base) / denominator
+	remainder := uint64(base) % denominator
+	return time.Duration(whole*numerator + remainder*numerator/denominator)
 }
 
 func (e *UDPEndpoint) closedError() error {
@@ -639,6 +651,9 @@ func (e *UDPEndpoint) readLoop() {
 			continue
 		}
 		m.RemoteAddr, m.LocalAddr, m.Multicast = remote, local, multicast
+		if m.Multicast && m.Type != NonConfirmable {
+			continue
+		}
 		if m.Type == Confirmable && m.Code == CodeEmpty {
 			if !m.Multicast {
 				if err := e.Send(&Message{Type: Reset, Code: CodeEmpty, MessageID: m.MessageID, RemoteAddr: remote}); err != nil {
@@ -798,7 +813,7 @@ func (e *UDPEndpoint) handleRequest(request *Message) {
 	if request.Multicast && e.cfg.MulticastLeisure > 0 {
 		var random [2]byte
 		_, _ = rand.Read(random[:])
-		delay := time.Duration(uint64(e.cfg.MulticastLeisure) * uint64(binary.BigEndian.Uint16(random[:])) / 65536)
+		delay := durationFraction(e.cfg.MulticastLeisure, uint64(binary.BigEndian.Uint16(random[:])), 65536)
 		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:

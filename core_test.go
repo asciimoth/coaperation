@@ -217,7 +217,7 @@ func TestCodecValidationErrors(t *testing.T) {
 	if _, err := UnmarshalUDP([]byte{0x41, 1, 0, 0}); err == nil {
 		t.Fatal("UnmarshalUDP accepted a truncated token")
 	}
-	if _, err := MarshalTCP(&Message{Options: []Option{NewOption(2, nil), NewOption(1, nil)}}); !errors.Is(err, ErrOptionOrder) {
+	if _, err := MarshalTCP(&Message{Code: Content, Options: []Option{NewOption(2, nil), NewOption(1, nil)}}); !errors.Is(err, ErrOptionOrder) {
 		t.Fatalf("MarshalTCP order error = %v", err)
 	}
 	for _, wire := range [][]byte{{0x00}, {0x10}, {0x20, 1, 0xf0}} {
